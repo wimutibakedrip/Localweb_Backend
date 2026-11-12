@@ -1,0 +1,29 @@
+name: Deploy FastAPI to Raspberry Pi
+
+on:
+  push:
+    branches: [ "main" ] # เปลี่ยนเป็น master หากคุณใช้ชื่อ master
+
+jobs:
+  deploy-backend:
+    runs-on: self-hosted
+    steps:
+      - name: ดึงโค้ดล่าสุดจาก GitHub
+        uses: actions/checkout@v4
+
+      - name: อัปเดตโค้ดไปที่โฟลเดอร์ใช้งานจริง (ไม่ทับ venv และ .env)
+        run: |
+          rsync -av --exclude 'venv' --exclude '.env' --exclude '.git' --exclude '__pycache__' ./ /home/ajcool/wimuti-app/wimuti-backend/
+
+      - name: ติดตั้ง Library เพิ่มเติม (ประหยัด RAM 1GB)
+        working-directory: /home/ajcool/wimuti-app/wimuti-backend
+        run: |
+          # เช็กก่อนว่ามีไฟล์ requirements.txt หรือไม่ ถ้ามีให้ติดตั้งโดยไม่เก็บ Cache เพื่อประหยัด RAM
+          if [ -f "requirements.txt" ]; then
+            ./venv/bin/pip install --no-cache-dir -r requirements.txt
+          fi
+
+      - name: รีสตาร์ท FastAPI เพื่อให้โค้ดใหม่ทำงาน
+        run: |
+          # แก้ชื่อ fastapi.service ให้ตรงกับชื่อ Service ที่คุณตั้งไว้ใน Pi
+          sudo systemctl restart fastapi.service
