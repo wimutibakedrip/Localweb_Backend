@@ -1,0 +1,802 @@
+import asyncio
+import datetime
+import time
+import shutil
+from zoneinfo import ZoneInfo
+from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, status, Query
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.orm import Session
+from sqlalchemy import func, and_
+from sqlalchemy.orm import joinedload
+from typing import List, Optional
+from pydantic import BaseModel
+
+from . import models
+from .database import engine, get_db, SessionLocal
+# อิมพอร์ตฟังก์ชันวาดรูปและสั่งพิมพ์มาจาก agent.py เดิม
+from .printer_agent import print_receipt_to_worrex, print_sales_report_to_worrex
+
+models.Base.metadata.create_all(bind=engine)
+
+app = FastAPI(title="Wimuti Bakery API")
+origins =["http://localhost:5173", "*"]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,  
+    allow_credentials=True,
+    allow_methods=["*"], 
+    allow_headers=["*"],
+)
+
+UPLOAD_DIR = "uploads"
+app.mount("/static-images", StaticFiles(directory=UPLOAD_DIR), name="static-images")
+
+# ==============================================================================
+# LOW-RESOURCE BACKGROUND PRINTER TASK (FOR RASPBERRY PI 4 1GB RAM)
+# ==============================================================================
+async def optimized_printer_loop():
+    print("[*] ฮาร์ดแวร์ Pi 4: เริ่มต้นระบบ Background Printer Task (Direct DB Mode)")
+    
+    while True:
+        # ใช้ SessionLocal สร้าง Session สั้นๆ เพื่อป้องกันหน่วยความจำรั่ว (Memory Leak) บน RAM 1GB
+        db: Session = SessionLocal()
+        try:
+            # 1. คิวรีหาออเดอร์ที่สั่งพิมพ์โดยตรงจาก DB (ไม่ต้องผ่าน HTTP HTTP Request)
+            orders = db.query(models.OrderModel)\
+                       .options(joinedload(models.OrderModel.items).joinedload(models.OrderItemModel.product))\
+                       .filter(models.OrderModel.is_print_requested == True)\
+                       .filter(models.OrderModel.is_printed == False)\
+                       .filter(models.OrderModel.status != models.OrderStatus.CANCELLED)\
+                       .all()
+
+            for order in orders:
+                order_id = order.id
+                
+                # แปลง SQLAlchemy Object เป็น Dict ชั่วคราวเพื่อส่งให้ฟังก์ชันพิมพ์เดิมของ agent.py
+                order_dict = {
+                    "id": order.id,
+                    "customer_name": order.customer_name,
+                    "subtotal_price": order.subtotal_price,
+                    "discount_price": order.discount_price,
+                    "grandtotal_price": order.grandtotal_price,
+                    "status": order.status.value if hasattr(order.status, 'value') else order.status,
+                    "notes": order.notes,
+                    "payment_method": order.payment_method,
+                    "created_at": order.created_at.isoformat() if order.created_at else None,
+                    "items": [{"quantity": item.quantity, "price": item.price, "custom_text": getattr(item, 'custom_text', None), "product": {"name": item.product.name if item.product else "สินค้า", "price": item.price}} for item in order.items]
+                }
+
+                # แยกพิมพ์ตามประเภท Flag
+                if order.is_print_order:
+                    success = print_receipt_to_worrex(order_dict, "order")
+                    if success:
+                        order.is_print_requested = False
+                        order.is_print_order = False
+                        order.is_printed = True
+                        db.commit()
+
+                elif order.is_print_receipt:
+                    success = print_receipt_to_worrex(order_dict, "receipt")
+                    if success:
+                        order.is_print_requested = False
+                        order.is_print_receipt = False
+                        order.is_printed = True
+                        db.commit()
+
+            # 2. ตรวจสอบคิวพิมพ์รายงานสรุปยอดขาย (In-Memory Queue)
+            if sales_report_queue.pending_reports:
+                current_job = sales_report_queue.pending_reports[0]
+                job_id = current_job["id"]
+                target_date = current_job["selected_date"]
+
+                # ดึงข้อมูลมาประมวลผลสรุปรายงาน
+                end_date = datetime.datetime.strptime(target_date, "%Y-%m-%d").date()
+                start_date = end_date - datetime.timedelta(days=6)
+                local_order_date = func.date(func.timezone('Asia/Bangkok', models.OrderModel.created_at))
+                date_filter = and_(local_order_date >= start_date, local_order_date <= end_date)
+                
+                total_revenue = db.query(func.sum(models.OrderModel.grandtotal_price)).filter(date_filter).filter(models.OrderModel.status == models.OrderStatus.COMPLETED).scalar() or 0.0
+                total_cash = db.query(func.sum(models.OrderModel.grandtotal_price)).filter(date_filter).filter(models.OrderModel.status == models.OrderStatus.COMPLETED).filter(models.OrderModel.payment_method == models.OrderPayment.CASH).scalar() or 0.0 
+                total_transfer = db.query(func.sum(models.OrderModel.grandtotal_price)).filter(date_filter).filter(models.OrderModel.status == models.OrderStatus.COMPLETED).filter(models.OrderModel.payment_method == models.OrderPayment.TRANSFER).scalar() or 0.0
+                total_discount = db.query(func.sum(models.OrderModel.discount_price)).filter(date_filter).filter(models.OrderModel.status == models.OrderStatus.COMPLETED).scalar() or 0.0
+                completed_orders_count = db.query(func.count(models.OrderModel.id)).filter(date_filter).filter(models.OrderModel.status == models.OrderStatus.COMPLETED).scalar() or 0
+                
+                top_items = db.query(models.OrderItemModel.product_id, func.sum(models.OrderItemModel.quantity).label("total_qty")).join(models.OrderModel).filter(date_filter).filter(models.OrderModel.status == models.OrderStatus.COMPLETED).group_by(models.OrderItemModel.product_id).order_by(func.sum(models.OrderItemModel.quantity).desc()).limit(20).all()
+                
+                top_products_list = []
+                for item in top_items:
+                    prod = db.query(models.ProductModel).filter(models.ProductModel.id == item.product_id).first()
+                    if prod:
+                        top_products_list.append({
+                            "name": prod.name, "qty": int(item.total_qty), "category": prod.category, "total_amount": float(prod.price * int(item.total_qty))
+                        })
+
+                report_job_data = {
+                    "job_id": job_id, "start_date": start_date.strftime("%d/%m/%Y"), "end_date": end_date.strftime("%d/%m/%Y"),
+                    "total_revenue": float(total_revenue), "total_orders": int(completed_orders_count), "total_cash": float(total_cash),
+                    "total_transfer": float(total_transfer), "total_discount": float(total_discount), "top_products": top_products_list
+                }
+
+                # สั่งพิมพ์รายงาน
+                if print_sales_report_to_worrex(report_job_data):
+                    # ลบงานออกจากคิวเมื่อพิมพ์สำเร็จ
+                    sales_report_queue.pending_reports = [r for r in sales_report_queue.pending_reports if r["id"] != job_id]
+
+        except Exception as e:
+            print(f"[Warning] เครื่องพิมพ์ขัดข้องบน Pi 4: {e}")
+        finally:
+            db.close() # ปิด Session ทุกครั้งเพื่อคืนหน่วยความจำให้ระบบ
+        
+        # หน่วงเวลา 4 วินาที (ปรับเพิ่มเล็กน้อยเพื่อลดภาระ CPU ของ Pi 4 ตัวเล็ก)
+        await asyncio.sleep(4)
+
+# สั่งให้ลูปทำงานแบบ Asynchronous เคียงข้างไปกับตัว API ทันทีเมื่อเปิดตัว Webserver
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(optimized_printer_loop())
+
+# ==============================================================================
+
+# CORS เพื่อให้ React สามารถยิง API มาหา FastAPI ได้
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,  
+    allow_credentials=True,
+    allow_methods=["*"], 
+    allow_headers=["*"],
+)
+
+# สำหรับฝั่ง ADMIN----------------------------------------------------------------
+class AdminLoginRequest(BaseModel):
+    password: str
+
+# สำหรับฝั่ง ADMIN: รหัสผ่าน Password ----------------------------------------------
+@app.post("/api/admin/verify-password")
+def verify_admin_password(request: AdminLoginRequest):
+    CORRECT_PASSWORD = "123456"  
+    if request.password != CORRECT_PASSWORD:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="รหัสผ่านผู้ดูแลระบบไม่ถูกต้อง!"
+        )
+    return {"message": "เข้าสู่ระบบสำเร็จ", "authenticated": True}
+
+# API สำหรับฝั่ง USER & ADMIN: ดึงข้อมูลเมนูทั้งหมด
+@app.get("/api/products")
+def get_all_products(db: Session = Depends(get_db)):
+    products = db.query(models.ProductModel).all()
+    from fastapi.encoders import jsonable_encoder
+    return jsonable_encoder(products)
+
+# API สำหรับฝั่ง ADMIN: เพิ่มเมนูขนมใหม่ POST พร้อมอัปโหลดรูป
+@app.post("/api/products")
+async def create_product(
+    name: str = Form(...),
+    category: str = Form(...),
+    price: float = Form(...),
+    pieces: int = Form(...),
+    image: str = Form("https://unsplash.com"),
+    desc: str = Form(None),
+    file: UploadFile = File(None), 
+    db: Session = Depends(get_db)
+):
+    image_url = image
+    if file and file.filename:
+        await file.seek(0)
+        clean_filename = f"{int(time.time())}_{file.filename.replace(' ', '_')}"
+        file_location = f"{UPLOAD_DIR}/{clean_filename}"
+        with open(file_location, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        image_url = f"/static-images/{clean_filename}"
+
+    db_product = models.ProductModel(
+        name=name, category=category, price=price, pieces=pieces,
+        image=image_url, desc=desc if desc else "", is_active=True
+    )    
+    try:
+        db.add(db_product)
+        db.commit()
+        db.refresh(db_product)
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"เกิดข้อผิดพลาด: {str(e)}")
+
+    from fastapi.encoders import jsonable_encoder
+    return jsonable_encoder(db_product)
+   
+# API สำหรับฝั่ง ADMIN: แก้ไขข้อมูลเมนูและราคา PUT
+@app.put("/api/products/{product_id}")
+async def update_product(
+    product_id: int,
+    name: str = Form(...),
+    category: str = Form(...),
+    price: float = Form(...),
+    pieces: int = Form(...),
+    image: str = Form("https://unsplash.com"),
+    desc: str = Form(None),
+    file: UploadFile = File(None), 
+    db: Session = Depends(get_db)
+):
+    db_product = db.query(models.ProductModel).filter(models.ProductModel.id == product_id).first()
+    if not db_product:
+        raise HTTPException(status_code=404, detail="ไม่พบเมนูสินค้านี้ in ระบบ")
+    
+    image_url = image
+    if file and file.filename:
+        await file.seek(0)
+        clean_filename = f"{int(time.time())}_{file.filename.replace(' ', '_')}"
+        file_location = f"{UPLOAD_DIR}/{clean_filename}"
+        with open(file_location, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        image_url = f"http://localhost:8000/static-images/{clean_filename}"
+
+    db_product.name = name
+    db_product.category = category
+    db_product.price = price
+    db_product.pieces = pieces
+    db_product.desc = desc if desc else ""
+    db_product.image = image_url
+
+    try:    
+        db.commit()
+        db.refresh(db_product)
+    except Exception as e:
+        db.rollback() 
+        raise HTTPException(status_code=400, detail=f"ไม่สามารถบันทึกข้อมูลแก้ไขได้เนื่องจาก: {str(e)}")        
+        
+    from fastapi.encoders import jsonable_encoder
+    return jsonable_encoder(db_product)
+
+# API สำหรับฝั่ง ADMIN: ลบเมนูออกจากระบบ DELETE
+@app.delete("/api/products/{product_id}", status_code=status.HTTP_200_OK)
+def delete_product(product_id: int, db: Session = Depends(get_db)):
+    db_product = db.query(models.ProductModel).filter(models.ProductModel.id == product_id).first()
+    if not db_product:
+        raise HTTPException(status_code=404, detail="ไม่พบเมนูสินค้านี้ในระบบ")
+    db.delete(db_product)
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback() 
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"ไม่สามารถลบข้อมูลได้เนื่องจาก: {str(e)}")
+    return {}
+
+# API สำหรับฝั่ง ADMIN: สลับสถานะ พร้อมขาย หรือ ยกเลิก PATCH
+@app.patch("/api/products/{product_id}/toggle-status")
+def toggle_product_status(product_id: int, db: Session = Depends(get_db)):
+    db_product = db.query(models.ProductModel).filter(models.ProductModel.id == product_id).first()
+    if not db_product:
+        raise HTTPException(status_code=404, detail="ไม่พบเมนูสินค้านี้ในระบบ")
+    db_product.is_active = not db_product.is_active
+    try:
+        db.commit()
+        db.refresh(db_product)
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"ไม่สามารถเปลี่ยนสถานะได้: {str(e)}")
+    from fastapi.encoders import jsonable_encoder
+    return {"message": "เปลี่ยนสถานะสินค้าเรียบร้อยแล้ว", "data": jsonable_encoder(db_product)}
+
+class OrderItemCreate(BaseModel):
+    product_id: int
+    quantity: int
+
+class OrderCreateRequest(BaseModel):
+    items: List[OrderItemCreate]
+    customer_name: str = ""
+    notes: str = ""    
+    discount_price: float = 0.0
+    payment_method: str = "โอน"
+
+class OrderStatusUpdateRequest(BaseModel):
+    status: str
+
+# API สำหรับฝั่ง USER: ส่งออเดอร์ใหม่เข้ามาในระบบ
+@app.post("/api/orders", status_code=status.HTTP_201_CREATED)
+def create_order(request: OrderCreateRequest, db: Session = Depends(get_db)):
+    subtotal_price = 0.0
+    order_items_to_add = []
+    
+    for req_item in request.items:
+        product = db.query(models.ProductModel).filter(models.ProductModel.id == req_item.product_id).first()
+        if not product:
+            raise HTTPException(status_code=404, detail=f"ไม่พบสินค้าไอดี #{req_item.product_id} ในระบบเมนู")
+            
+        if product.pieces < req_item.quantity:
+            raise HTTPException(status_code=400, detail=f"สินค้า '{product.name}' มีสต็อกไม่เพียงพอ")
+            
+        item_total_price = product.price * req_item.quantity
+        subtotal_price += item_total_price
+        product.pieces -= req_item.quantity
+        
+        order_item = models.OrderItemModel(product_id=product.id, quantity=req_item.quantity, price=product.price)
+        order_items_to_add.append(order_item)
+
+    discount_amount = request.discount_price
+    grandtotal_price = max(0.0, subtotal_price - discount_amount)
+    thailand_now = datetime.datetime.now(ZoneInfo("Asia/Bangkok"))
+
+    new_order = models.OrderModel(
+        customer_name=request.customer_name, subtotal_price=subtotal_price,
+        discount_price=discount_amount, grandtotal_price=grandtotal_price,
+        status=models.OrderStatus.PENDING, notes=request.notes,
+        payment_method=request.payment_method, created_at=thailand_now, items=order_items_to_add
+    )
+    try:
+        db.add(new_order)
+        db.commit()
+        db.refresh(new_order)
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"เกิดข้อผิดพลาดในการบันทึกออเดอร์: {str(e)}")
+        
+    from fastapi.encoders import jsonable_encoder
+    return jsonable_encoder(new_order)
+
+# ฟังก์ชันดึงออเดอร์คิวครัว
+@app.get("/api/orders")
+def get_all_orders(selected_date: Optional[str] = Query(None, description="YYYY-MM-DD"), db: Session = Depends(get_db)):
+    if selected_date:
+        end_date = datetime.datetime.strptime(selected_date, "%Y-%m-%d").date()
+    else:
+        end_date = datetime.datetime.now(ZoneInfo("Asia/Bangkok")).date()
+
+    start_date = end_date - datetime.timedelta(days=6)
+    local_order_date = func.date(func.timezone('Asia/Bangkok', models.OrderModel.created_at))
+
+    orders = db.query(models.OrderModel)\
+                .options(joinedload(models.OrderModel.items).joinedload(models.OrderItemModel.product))\
+                .filter(and_(
+                        local_order_date >= start_date,
+                        local_order_date <= end_date))\
+                .filter(models.OrderModel.status != models.OrderStatus.CANCELLED)\
+                .order_by(models.OrderModel.created_at.desc()).all()
+               
+    result = []
+    for order in orders:
+        order_dict = {
+            "id": order.id, "customer_name": order.customer_name, "subtotal_price": order.subtotal_price,
+            "discount_price": order.discount_price, "grandtotal_price": order.grandtotal_price,
+            "status": order.status.value if hasattr(order.status, 'value') else order.status,
+            "notes": order.notes, "payment_method": order.payment_method,
+            "is_printed": getattr(order, 'is_printed', False), 
+            "created_at": order.created_at.isoformat() if order.created_at else None, "items": []  
+        }
+        for item in order.items:
+            item_dict = {
+                "id": item.id, "product_id": item.product_id, "quantity": item.quantity, "price": item.price,
+                "product": {"id": item.product.id, "name": item.product.name, "price": item.product.price} if item.product else None
+            }
+            order_dict["items"].append(item_dict)
+        result.append(order_dict)
+
+    from fastapi.encoders import jsonable_encoder
+    return jsonable_encoder(result)
+
+# อัปเดตสถานะออเดอร์
+@app.put("/api/orders/{order_id}/status")
+def update_order_status(order_id: int, request: OrderStatusUpdateRequest, db: Session = Depends(get_db)):
+    order = db.query(models.OrderModel).filter(models.OrderModel.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="ไม่พบรายการออเดอร์นี้ในคิว")
+        
+    current_status_str = order.status.value if hasattr(order.status, 'value') else str(order.status)
+    if current_status_str in ["สำเร็จ", "ยกเลิก"]:
+        raise HTTPException(status_code=400, detail="ไม่สามารถเปลี่ยนสถานะออเดอร์ที่สิ้นสุดแล้วได้")
+    
+    matched_status = None
+    for enum_item in models.OrderStatus:
+        if enum_item.value == request.status:
+            matched_status = enum_item
+            break           
+    if not matched_status:
+        raise HTTPException(status_code=422, detail="สถานะไม่สอดคล้องกับระเบียบ")
+
+    if (request.status == "ยกเลิก" or matched_status == models.OrderStatus.CANCELLED) and order.status != matched_status:
+        for item in order.items:
+            product = db.query(models.ProductModel).filter(models.ProductModel.id == item.product_id).first()
+            if product: product.pieces += item.quantity  
+            
+    order.status = matched_status
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"ไม่สามารถเปลี่ยนสถานะได้: {str(e)}")        
+    return {}
+
+# API สำหรับฝั่ง ADMIN: รายงานยอดขายรวมและสินค้าขายดี
+@app.get("/api/sales/summary")
+def get_sales_summary(selected_date: Optional[str] = Query(None, description="YYYY-MM-DD"), db: Session = Depends(get_db)):
+    if selected_date:
+        end_date = datetime.datetime.strptime(selected_date, "%Y-%m-%d").date()
+    else:
+        end_date = datetime.datetime.now(ZoneInfo("Asia/Bangkok")).date()
+
+    start_date = end_date - datetime.timedelta(days=6)
+    local_order_date = func.date(func.timezone('Asia/Bangkok', models.OrderModel.created_at))
+    date_filter = and_(
+                        local_order_date >= start_date,
+                        local_order_date <= end_date)
+                        
+    #date_filter = func.date(func.timezone('Asia/Bangkok', models.OrderModel.created_at)) == func.date(func.timezone('Asia/Bangkok', target_date))
+
+    total_revenue = db.query(func.sum(models.OrderModel.grandtotal_price)).filter(date_filter).filter(models.OrderModel.status == models.OrderStatus.COMPLETED).scalar() or 0.0
+    total_cash = db.query(func.sum(models.OrderModel.grandtotal_price)).filter(date_filter).filter(models.OrderModel.status == models.OrderStatus.COMPLETED).filter(models.OrderModel.payment_method == models.OrderPayment.CASH).scalar() or 0.0 
+    total_transfer = db.query(func.sum(models.OrderModel.grandtotal_price)).filter(date_filter).filter(models.OrderModel.status == models.OrderStatus.COMPLETED).filter(models.OrderModel.payment_method == models.OrderPayment.TRANSFER).scalar() or 0.0
+          
+    status_counts = db.query(models.OrderModel.status, func.count(models.OrderModel.id)).filter(date_filter).group_by(models.OrderModel.status).all()
+                      
+    status_distribution = {}
+    for status_enum, count in status_counts:
+        status_str = status_enum.value if hasattr(status_enum, 'value') else str(status_enum)
+        status_distribution[status_str] = count
+
+    # เลือก 20 top รายการล่าสุด -------------------------------------------
+    rec_limit = 20
+    top_items = db.query(models.OrderItemModel.product_id, func.sum(models.OrderItemModel.quantity).label("total_qty")).join(models.OrderModel).filter(date_filter).filter(models.OrderModel.status == models.OrderStatus.COMPLETED).group_by(models.OrderItemModel.product_id).order_by(func.sum(models.OrderItemModel.quantity).desc()).limit(rec_limit).all()
+     
+    top_products_list = []
+    for item in top_items:
+        prod = db.query(models.ProductModel).filter(models.ProductModel.id == item.product_id).first()
+        if prod:
+            top_products_list.append({"name": prod.name, "qty": int(item.total_qty), "category": prod.category})
+
+    return {
+        "total_revenue": float(total_revenue), "total_cash": float(total_cash), "total_transfer": float(total_transfer),
+        "status_distribution": status_distribution, "top_products": top_products_list
+    }
+
+# API สำหรับฝั่ง ADMIN: รายงานยอดขายรวมและสินค้าขายดี แสดงรายละเอียดลูกค้า
+@app.get("/api/sales/product-buyers")
+def get_product_buyers(
+    product_name: str = Query(..., description="ชื่อสินค้าที่ต้องการฟิลเตอร์"),
+    selected_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    db: Session = Depends(get_db)
+):
+    # คำนวณช่วงเวลาแบบ 7 วันย้อนหลังให้สอดคล้องกับหน้าคิวและรายงาน
+    if selected_date:
+        end_date = datetime.datetime.strptime(selected_date, "%Y-%m-%d").date()
+    else:
+        end_date = datetime.datetime.now(ZoneInfo("Asia/Bangkok")).date()
+    start_date = end_date - datetime.timedelta(days=6)
+
+    date_filter = func.date(func.timezone('Asia/Bangkok', models.OrderModel.created_at))
+
+    # ค้นหาข้อมูลออเดอร์ พร้อมทำการ SUM(quantity) และ GROUP BY customer_name
+    buyers = db.query(
+        models.OrderModel.customer_name,
+        func.sum(models.OrderItemModel.quantity).label("total_qty") # ใช้ func.sum คำนวณยอดรวมชิ้น
+    ).join(models.OrderItemModel).join(models.ProductModel)\
+     .filter(date_filter >= start_date)\
+     .filter(date_filter <= end_date)\
+     .filter(models.OrderModel.status == models.OrderStatus.COMPLETED)\
+     .filter(models.ProductModel.name == product_name)\
+     .group_by(models.OrderModel.customer_name)\
+     .order_by(func.sum(models.OrderItemModel.quantity).desc()).all() 
+
+    # แปลงผลลัพธ์เป็นโครงสร้าง Array Object ส่งกลับไปให้ React (เปลี่ยนจาก b.quantity เป็น b.total_qty ตามคีย์ใหม่)
+    return [{"customer_name": b.customer_name or "ไม่ระบุชื่อ/หน้าร้าน", "qty": int(b.total_qty)} for b in buyers]
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# API สำหรับอัปเดตแก้ไขรายการออเดอร์เดิมจากตะกร้า
+@app.put("/api/orders/{order_id}")
+def update_existing_order(order_id: int, request: OrderCreateRequest, db: Session = Depends(get_db)):
+    order = db.query(models.OrderModel).filter(models.OrderModel.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="ไม่พบรายการออเดอร์ใบนี้ในระบบ")
+
+    current_status_str = order.status.value if hasattr(order.status, 'value') else str(order.status)
+    if current_status_str in ["สำเร็จ", "ยกเลิก"]:
+        raise HTTPException(status_code=400, detail="ไม่สามารถแก้ไขออเดอร์ใบนี้ได้แล้ว")
+
+    # คืนสต็อกชั่วคราว
+    for old_item in order.items:
+        product = db.query(models.ProductModel).filter(models.ProductModel.id == old_item.product_id).first()
+        if product: product.pieces += old_item.quantity
+
+    # ลบแถวย่อยเดิม
+    db.query(models.OrderItemModel).filter(models.OrderItemModel.order_id == order_id).delete()
+
+    subtotal_price = 0.0
+    order_items_to_add = []
+
+    # คำนวณใหม่และตัดสต็อกจริง
+    for req_item in request.items:
+        product = db.query(models.ProductModel).filter(models.ProductModel.id == req_item.product_id).first()
+        if not product: raise HTTPException(status_code=404, detail="ไม่พบสินค้าในคลัง")
+            
+        if product.pieces < req_item.quantity:
+            raise HTTPException(status_code=400, detail="จำนวนสต็อกหลังแก้ไขไม่เพียงพอ")
+            
+        subtotal_price += product.price * req_item.quantity
+        product.pieces -= req_item.quantity
+        
+        order_item = models.OrderItemModel(order_id=order.id, product_id=product.id, quantity=req_item.quantity, price=product.price)
+        order_items_to_add.append(order_item)
+
+    discount_amount = request.discount_price
+    grandtotal_price = max(0.0, subtotal_price - discount_amount)
+
+    order.customer_name = request.customer_name
+    order.subtotal_price = subtotal_price
+    order.discount_price = discount_amount
+    order.grandtotal_price = grandtotal_price
+    order.notes = request.notes
+    order.payment_method = request.payment_method
+    order.items = order_items_to_add 
+
+    try:
+        db.commit()
+        db.refresh(order)
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"เกิดข้อผิดพลาดในการบันทึกอัปเดต: {str(e)}")
+        
+    from fastapi.encoders import jsonable_encoder
+    return jsonable_encoder(order)
+
+# ---------------------------------------------------------------------------------------------------------------
+# 1. Pydantic Schema สำหรับรับค่าอัปเดตสถานะการพิมพ์
+class PrintStatusUpdate(BaseModel):
+    is_printed: bool
+
+# 2. API ให้คอมพิวเตอร์ตัวกลางที่ร้านดึงรายการออเดอร์ที่ยังไม่ได้พิมพ์
+@app.get("/api/orders/pending-print")
+def get_pending_print_orders(db: Session = Depends(get_db)):
+    orders = db.query(models.OrderModel)\
+                .options(joinedload(models.OrderModel.items).joinedload(models.OrderItemModel.product))\
+                .filter(models.OrderModel.is_printed == False)\
+                .filter(models.OrderModel.status != models.OrderStatus.CANCELLED)\
+                .all()
+    
+    from fastapi.encoders import jsonable_encoder
+    return jsonable_encoder(orders)
+
+# 3. API อัปเดตสถานะว่าคอมพิวเตอร์ที่ร้านสั่งพิมพ์ออกเครื่อง Worrex สำเร็จแล้ว
+@app.patch("/api/orders/{order_id}/print-status")
+def update_print_status(order_id: int, request: PrintStatusUpdate, db: Session = Depends(get_db)):
+    order = db.query(models.OrderModel).filter(models.OrderModel.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="ไม่พบออเดอร์นี้")
+    
+    order.is_printed = request.is_printed
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+        
+    return {"message": "อัปเดตสถานะการพิมพ์สำเร็จ", "order_id": order.id}
+
+#========================================================================================
+# Schema สำหรับรับค่าคำขอพิมพ์
+class PrintRequestUpdate(BaseModel):
+    is_print_requested: bool
+    is_print_order: Optional[bool] = False
+    is_print_receipt: Optional[bool] = False
+
+#-------------------------------------------------------------------------------------
+# API ให้ดึงเฉพาะออร์เดอร์ที่ "สั่งพิมพ์เข้ามาแล้วเท่านั้น"
+@app.get("/api/orders/requested-print")
+def get_requested_print_orders(db: Session = Depends(get_db)):
+    orders = db.query(models.OrderModel)\
+                .options(joinedload(models.OrderModel.items).joinedload(models.OrderItemModel.product))\
+                .filter(models.OrderModel.is_print_requested == True)\
+                .filter(models.OrderModel.is_printed == False)\
+                .filter(models.OrderModel.status != models.OrderStatus.CANCELLED)\
+                .all()
+    
+    # แปลงข้อมูลรวมถึงสถานะการพิมพ์แบบแยกประเภท
+    result = []
+    for order in orders:
+        order_dict = {
+            "id": order.id, 
+            "customer_name": order.customer_name, 
+            "subtotal_price": order.subtotal_price,
+            "discount_price": order.discount_price, 
+            "grandtotal_price": order.grandtotal_price,
+            "status": order.status.value if hasattr(order.status, 'value') else order.status,
+            "notes": order.notes, 
+            "payment_method": order.payment_method,
+            "is_printed": order.is_printed,
+            "is_print_order": getattr(order, 'is_print_order', False),
+            "is_print_receipt": getattr(order, 'is_print_receipt', False),
+            "created_at": order.created_at.isoformat() if order.created_at else None, 
+            "items": []  
+        }
+        for item in order.items:
+            item_dict = {
+                "id": item.id, "product_id": item.product_id, "quantity": item.quantity, "price": item.price,
+                "product": {"id": item.product.id, "name": item.product.name, "price": item.product.price} if item.product else None
+            }
+            order_dict["items"].append(item_dict)
+        result.append(order_dict)
+
+    from fastapi.encoders import jsonable_encoder
+    return jsonable_encoder(result)
+
+#--------------------------------------------------------------------------------------
+@app.patch("/api/orders/{order_id}/request-print")
+def request_print_order(order_id: int, request: PrintRequestUpdate, db: Session = Depends(get_db)):
+    order = db.query(models.OrderModel).filter(models.OrderModel.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="ไม่พบออเดอร์นี้")
+    
+    order.is_print_requested = request.is_print_requested
+    order.is_print_order = request.is_print_order
+    order.is_print_receipt = request.is_print_receipt
+    order.is_printed = False  # รีเซ็ตสถานะเพื่อให้ Local Agent ทราบว่ามีงานรอพิมพ์
+    
+    db.commit()
+    return {"message": "จัดคิวพิมพ์เรียบร้อย"}
+
+#----------------------------------------------------------------------------------------
+# API อัปเดตสถานะเมื่อพิมพ์เสร็จแล้ว ให้ปิดคำขอพิมพ์
+@app.patch("/api/orders/{order_id}/mark-printed")
+def mark_order_printed(order_id: int, db: Session = Depends(get_db)):
+    order = db.query(models.OrderModel).filter(models.OrderModel.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="ไม่พบออเดอร์นี้")
+    
+    order.is_print_requested = False  
+    order.is_print_order = False
+    order.is_print_receipt = False
+    order.is_printed = True           # ตั้งค่าว่าพิมพ์เสร็จแล้ว
+    db.commit()
+
+    return {"message": "พิมพ์สำเร็จและเคลียร์คิวเรียบร้อย"}
+
+#----------------------------------------------------------------------------------------
+# API คำขอพิมพ์รายงานสรุปยอดขาย
+
+class SalesReportPrintQueue:
+    pending_reports = []  # เก็บลิสต์ของคำขอพิมพ์สรุปยอดขาย เช่น [{"date": "2026-11-09", "id": 16900000}]
+
+sales_report_queue = SalesReportPrintQueue()
+
+# 1. API ฝั่งแอดมินสำหรับกดสั่งพิมพ์จากหน้าบ้าน (React)
+@app.patch("/api/sales/request-print-report")
+def request_print_sales_report(selected_date: str = Query(..., description="YYYY-MM-DD")):
+    import time
+    report_request = {
+        "id": int(time.time()),
+        "selected_date": selected_date
+    }
+    sales_report_queue.pending_reports.append(report_request)
+    return {"message": "จัดคิวพิมพ์รายงานสำเร็จ", "report_id": report_request["id"]}
+
+# 2. API ให้ Local Printer Agent ยิงมาสแกนตรวจหาคิวงานพิมพ์รายงานยอดขายที่ค้างอยู่
+@app.get("/api/sales/pending-print-report")
+def get_pending_print_sales_reports(db: Session = Depends(get_db)):
+    
+    if not sales_report_queue.pending_reports:
+        return []
+    
+    # เอาคิวแรกสุดออกไปประมวลผลคำนวณตัวเลขและดึงรายการสินค้า 20 อันดับทันที
+    current_job = sales_report_queue.pending_reports[0]
+    target_date = current_job["selected_date"]
+    
+    # คำนวณสรุปยอดขาย
+    end_date = datetime.datetime.strptime(target_date, "%Y-%m-%d").date()
+    start_date = end_date - datetime.timedelta(days=6)
+    local_order_date = func.date(func.timezone('Asia/Bangkok', models.OrderModel.created_at))
+    date_filter = and_(local_order_date >= start_date, local_order_date <= end_date)
+    
+    total_revenue = db.query(func.sum(models.OrderModel.grandtotal_price)).filter(date_filter).filter(models.OrderModel.status == models.OrderStatus.COMPLETED).scalar() or 0.0
+    total_cash = db.query(func.sum(models.OrderModel.grandtotal_price)).filter(date_filter).filter(models.OrderModel.status == models.OrderStatus.COMPLETED).filter(models.OrderModel.payment_method == models.OrderPayment.CASH).scalar() or 0.0 
+    total_transfer = db.query(func.sum(models.OrderModel.grandtotal_price)).filter(date_filter).filter(models.OrderModel.status == models.OrderStatus.COMPLETED).filter(models.OrderModel.payment_method == models.OrderPayment.TRANSFER).scalar() or 0.0
+    total_discount = db.query(func.sum(models.OrderModel.discount_price)).filter(date_filter).filter(models.OrderModel.status == models.OrderStatus.COMPLETED).scalar() or 0.0
+    completed_orders_count = db.query(func.count(models.OrderModel.id)).filter(date_filter).filter(models.OrderModel.status == models.OrderStatus.COMPLETED).scalar() or 0
+    
+    # 20 อันดับสินค้าขายดี พร้อมคำนวณยอดเงินรวมของแต่ละสินค้าเพิ่มเติม (ราคาคูณจำนวน)
+    top_items = db.query(
+        models.OrderItemModel.product_id, 
+        func.sum(models.OrderItemModel.quantity).label("total_qty")
+    ).join(models.OrderModel).filter(date_filter).filter(models.OrderModel.status == models.OrderStatus.COMPLETED).group_by(models.OrderItemModel.product_id).order_by(func.sum(models.OrderItemModel.quantity).desc()).limit(20).all()
+    
+    top_products_list = []
+    for item in top_items:
+        prod = db.query(models.ProductModel).filter(models.ProductModel.id == item.product_id).first()
+        if prod:
+            # คำนวณราคารวมที่ขายได้ของสินค้านั้น ๆ ในรอบสัปดาห์
+            total_item_sales_amount = prod.price * int(item.total_qty)
+            top_products_list.append({
+                "name": prod.name, 
+                "qty": int(item.total_qty), 
+                "category": prod.category,
+                "total_amount": float(total_item_sales_amount)
+            })
+
+    # ส่งข้อมูลสรุปที่สมบูรณ์กลับไปให้ Agent วาดรูปกราฟิกเพื่อพิมพ์ลงกระดาษความร้อน
+    return [{
+        "job_id": current_job["id"],
+        "start_date": start_date.strftime("%d/%m/%Y"),
+        "end_date": end_date.strftime("%d/%m/%Y"),
+        "total_revenue": float(total_revenue),
+        "total_orders": int(completed_orders_count),
+        "total_cash": float(total_cash),
+        "total_transfer": float(total_transfer),
+        "total_discount": float(total_discount), 
+        "top_products": top_products_list
+    }]
+
+# 3. API สั่งเคลียร์คิวพิมพ์รายงานเมื่อฝั่ง Agent แจ้งพิมพ์กระดาษเสร็จแล้ว
+@app.delete("/api/sales/clear-print-report/{job_id}")
+def clear_printed_sales_report(job_id: int):
+    sales_report_queue.pending_reports = [r for r in sales_report_queue.pending_reports if r["id"] != job_id]
+    return {"message": "เคลียร์คิวพิมพ์รายงานสำเร็จ"}
+
+#-------------------------------------------------------------------------------------------------------------------------------
+# เพิ่ม Dashboard
+@app.get("/api/sales/dashboard-analytics")
+def get_dashboard_analytics_report(selected_date: Optional[str] = Query(None), db: Session = Depends(get_db)):
+    if selected_date:
+        end_date = datetime.datetime.strptime(selected_date, "%Y-%m-%d").date()
+    else:
+        end_date = datetime.datetime.now(ZoneInfo("Asia/Bangkok")).date()
+        
+    start_date = end_date - datetime.timedelta(days=6)
+    local_order_date = func.date(func.timezone('Asia/Bangkok', models.OrderModel.created_at))
+    date_filter = and_(local_order_date >= start_date, local_order_date <= end_date)
+
+    # 1. รายได้รวมรายอาทิตย์
+    weekly_revenue = db.query(func.sum(models.OrderModel.grandtotal_price)).filter(date_filter).filter(models.OrderModel.status == models.OrderStatus.COMPLETED).scalar() or 0.0
+    
+    # 2. จำนวนบิลที่เสร็จสิ้น และหาค่าเฉลี่ย Ticket Size ต่อบิล
+    total_completed_orders = db.query(func.count(models.OrderModel.id)).filter(date_filter).filter(models.OrderModel.status == models.OrderStatus.COMPLETED).scalar() or 0
+    avg_ticket_size = (weekly_revenue / total_completed_orders) if total_completed_orders > 0 else 0.0
+
+    # 3. สรุปประเภทการชำระเงินโอน และเงินสด
+    t_cash = db.query(func.sum(models.OrderModel.grandtotal_price)).filter(date_filter).filter(models.OrderModel.status == models.OrderStatus.COMPLETED).filter(models.OrderModel.payment_method == models.OrderPayment.CASH).scalar() or 0.0
+    t_transfer = db.query(func.sum(models.OrderModel.grandtotal_price)).filter(date_filter).filter(models.OrderModel.status == models.OrderStatus.COMPLETED).filter(models.OrderModel.payment_method == models.OrderPayment.TRANSFER).scalar() or 0.0
+    
+    pay_sum = t_cash + t_transfer
+    cash_p = (t_cash / pay_sum * 100) if pay_sum > 0 else 0
+    transfer_p = (t_transfer / pay_sum * 100) if pay_sum > 0 else 0
+
+    # 4. เจาะสถิติตัวเลขรายวันย้อนหลัง 7 วันเพื่อทำกราฟเส้น/แท่ง
+    daily_trend_list = []
+    max_daily_rev = 1.0 # ใช้ดักการหารเป็นศูนย์
+    
+    for i in range(7):
+        current_day = start_date + datetime.timedelta(days=i)
+        day_rev = db.query(func.sum(models.OrderModel.grandtotal_price)).filter(local_order_date == current_day).filter(models.OrderModel.status == models.OrderStatus.COMPLETED).scalar() or 0.0
+        if day_rev > max_daily_rev:
+            max_daily_rev = day_rev
+        daily_trend_list.append({"date": current_day.strftime("%a (%d)"), "revenue": float(day_rev)})
+        
+    for day_data in daily_trend_list:
+        day_data["percent"] = (day_data["revenue"] / max_daily_rev) * 100
+
+    # 5. สรุปชื่อลูกค้าขาประจำสั่งซื้อบ่อยและยอดเปย์สูงสุด (Top Loyalty Buyers)
+    loyalty_buyers = db.query(
+        models.OrderModel.customer_name,
+        func.count(models.OrderModel.id).label("bill_count"),
+        func.sum(models.OrderModel.grandtotal_price).label("total_spent")
+    ).filter(date_filter).filter(models.OrderModel.status == models.OrderStatus.COMPLETED)\
+     .group_by(models.OrderModel.customer_name)\
+     .order_by(func.sum(models.OrderModel.grandtotal_price).desc()).limit(5).all()
+
+    top_buyers_list = [
+        {
+            "customer_name": b.customer_name or "ลูกค้าหน้าร้าน/ไม่ระบุชื่อ",
+            "total_orders": int(b.bill_count),
+            "total_spent": float(b.total_spent)
+        } for b in loyalty_buyers
+    ]
+
+    return {
+        "weekly_revenue": float(weekly_revenue),
+        "avg_ticket_size": float(avg_ticket_size),
+        "total_completed_orders": int(total_completed_orders),
+        "payment_summary": {
+            "cash": float(t_cash), "transfer": float(t_transfer),
+            "cash_percent": cash_p, "transfer_percent": transfer_p
+        },
+        "daily_trend": daily_trend_list,
+        "top_buyers": top_buyers_list
+    }
