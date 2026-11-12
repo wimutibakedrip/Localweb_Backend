@@ -118,8 +118,13 @@ def generate_receipt_graphic(order, title):
     
     if os.path.exists(qrcode_path):
         try:
-            qrcode_img = Image.open(qrcode_path).convert("L").resize((320, 320), Image.Resampling.LANCZOS)
-        except Exception as e: print(f"[Error] โหลด QR Code ไม่สำเร็จ: {e}")
+            qr = Image.open(qrcode_path).convert("L")
+            qr_width = 320
+            wpercent = qr_width / float(qr.size[0])
+            qr_height = int(float(qr.size[1]) * float(wpercent))
+            qrcode_img = qr.resize((qr_width, qr_height), Image.Resampling.LANCZOS)
+        except Exception as e:
+            print(f"[Error] โหลด QR Code ไม่สำเร็จ: {e}")
 
     lines.extend([("center", "\n", font_normal), ("center", title, font_title if "COPY" in title else font_normal), ("center", "-" * 66, font_normal)])
     dt_th = datetime.datetime.fromisoformat(order.get('created_at', '').replace('Z', '+00:00')).astimezone(ZoneInfo("Asia/Bangkok")).strftime("%d/%m/%Y %H:%M:%S")
