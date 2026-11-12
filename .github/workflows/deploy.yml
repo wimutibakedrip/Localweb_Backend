@@ -9,7 +9,7 @@ jobs:
     runs-on: self-hosted
     steps:
       - name: ดึงโค้ดล่าสุดจาก GitHub
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: อัปเดตโค้ดไปที่โฟลเดอร์ใช้งานจริง (ไม่ทับ venv และ .env)
         run: |
