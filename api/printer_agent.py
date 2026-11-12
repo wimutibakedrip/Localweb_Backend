@@ -119,7 +119,7 @@ def generate_receipt_graphic(order, title):
     if os.path.exists(qrcode_path):
         try:
             qr = Image.open(qrcode_path).convert("L")
-            qr_width = 320
+            qr_width = 280
             wpercent = qr_width / float(qr.size[0])
             qr_height = int(float(qr.size[1]) * float(wpercent))
             qrcode_img = qr.resize((qr_width, qr_height), Image.Resampling.LANCZOS)
