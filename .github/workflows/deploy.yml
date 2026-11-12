@@ -26,4 +26,4 @@ jobs:
       - name: รีสตาร์ท FastAPI เพื่อให้โค้ดใหม่ทำงาน
         run: |
           # แก้ชื่อ fastapi.service ให้ตรงกับชื่อ Service ที่คุณตั้งไว้ใน Pi
-          sudo systemctl restart fastapi.service
+          sudo systemctl restart wimuti-backend.service
