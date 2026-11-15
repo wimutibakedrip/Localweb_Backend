@@ -254,16 +254,10 @@ def generate_receipt_graphic(order, title):
             d.text(((img_width - (bbox1[2] - bbox1[0])) / 2, current_y), PROMPTPAY_NAME, fill='black', font=font_bold)
             current_y += 26
 
-            # บรรทัดที่ 2: เบอร์มือถือ
-            phone_info = f"เบอร์มือถือ"
-            bbox2 = d.textbbox((0, 0), phone_info, font=font_normal)
-            d.text(((img_width - (bbox2[2] - bbox2[0])) / 2, current_y), phone_info, fill='black', font=font_normal)
-            current_y += 26    
-
-            # บรรทัดที่ 3: หมายเลข
+            # บรรทัดที่ 2: หมายเลข
             phone_display = f"โทร: {PROMPTPAY_PHONE}"
-            bbox3 = d.textbbox((0, 0), phone_display, font=font_normal)
-            d.text(((img_width - (bbox3[2] - bbox3[0])) / 2, current_y), phone_display, fill='black', font=font_normal)
+            bbox2 = d.textbbox((0, 0), phone_display, font=font_normal)
+            d.text(((img_width - (bbox2[2] - bbox2[0])) / 2, current_y), phone_display, fill='black', font=font_normal)
             current_y += 26
 
     return img.crop((0, 0, img_width, current_y + 10))
