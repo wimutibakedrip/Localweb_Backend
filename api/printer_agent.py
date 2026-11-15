@@ -253,7 +253,7 @@ def generate_receipt_graphic(order, title):
         
         if select_qr == 'N':
             PROMPTPAY_NAME = "นายอรรถกร เสนาะกรรณ์"
-            phone_display = f"โทร: {PROMPTPAY_PHONE}"
+            phone_display = f"{PROMPTPAY_PHONE}"
 
             # บรรทัดที่ 1: ชื่อ-นามสกุล (ระบุ Index [2] และ [0] ให้ครบ)
             bbox1 = d.textbbox((0, 0), PROMPTPAY_NAME, font=font_bold)
