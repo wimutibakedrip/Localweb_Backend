@@ -218,16 +218,20 @@ def generate_receipt_graphic(order, title):
 
     #=====================================================================================
     # คำนวณความสูงกระดาษ (เพิ่มพื้นที่เผื่อข้อความชื่อและเบอร์โทรอีก 65px กรณี selectqrcode == 'N')
-    extra_qr_text_h = 65 if (select_qr == 'N' and qrcode_img) else 0
+    extra_qr_text_h = 80 if (select_qr == 'N' and qrcode_img) else 0
     logo_h = logo_img.size[1] if logo_img else 0
     qr_h = qrcode_img.size[1] if qrcode_img else 0
-    img = Image.new('RGB', (img_width, len(lines) * 24 + 60 + logo_h + qr_h), color='white')
+
+    # สร้างพื้นหลังสีขาวให้คลุมถึงบรรทัดสุดท้าย
+    total_height = len(lines) * 24 + 60 + logo_h + qr_h + extra_qr_text_h
+    img = Image.new('RGB', (img_width, total_height), color='white')
     d = ImageDraw.Draw(img)
     current_y = margin
 
     if logo_img:
         img.paste(logo_img, (int((img_width - logo_img.size[0]) / 2), int(current_y)))
         current_y += logo_img.size[1] + 15
+
     for l_type, text_data, font in lines:
         if l_type == "center":
             bbox = d.textbbox((0, 0), text_data, font=font)
@@ -245,22 +249,27 @@ def generate_receipt_graphic(order, title):
     # วาดรูป QR Code และข้อความด้านล่าง
     if qrcode_img:
         img.paste(qrcode_img, (int((img_width - qrcode_img.size[0]) / 2), int(current_y + 5)))
-        current_y += qrcode_img.size[1] + 10
+        current_y += qrcode_img.size[1] + 15  # เว้นระยะห่างใต้รูป QR Code 15px
         
-        # ถ้าเป็นพร้อมเพย์ ('N') ให้พิมพ์ชื่อและเบอร์โทรต่อท้ายด้านล่าง
         if select_qr == 'N':
-            # บรรทัดที่ 1: ชื่อ
-            bbox1 = d.textbbox((0, 0), PROMPTPAY_NAME, font=font_bold)
-            d.text(((img_width - (bbox1[2] - bbox1[0])) / 2, current_y), PROMPTPAY_NAME, fill='black', font=font_bold)
-            current_y += 26
-
-            # บรรทัดที่ 2: หมายเลข
+            PROMPTPAY_NAME = "นายอรรถกร เสนาะกรรณ์"
             phone_display = f"โทร: {PROMPTPAY_PHONE}"
-            bbox2 = d.textbbox((0, 0), phone_display, font=font_normal)
-            d.text(((img_width - (bbox2[2] - bbox2[0])) / 2, current_y), phone_display, fill='black', font=font_normal)
-            current_y += 26
 
-    return img.crop((0, 0, img_width, current_y + 10))
+            # บรรทัดที่ 1: ชื่อ-นามสกุล (ระบุ Index [2] และ [0] ให้ครบ)
+            bbox1 = d.textbbox((0, 0), PROMPTPAY_NAME, font=font_bold)
+            text_w1 = bbox1[2] - bbox1[0]
+            d.text(((img_width - text_w1) / 2, current_y), PROMPTPAY_NAME, fill='black', font=font_bold)
+            current_y += 28
+            
+            # บรรทัดที่ 2: เบอร์โทร
+            bbox2 = d.textbbox((0, 0), phone_display, font=font_normal)
+            text_w2 = bbox2[2] - bbox2[0]
+            d.text(((img_width - text_w2) / 2, current_y), phone_display, fill='black', font=font_normal)
+            current_y += 28
+
+    # ป้องกันการ Crop เกินความสูงจริงของรูป (ไม่ให้เกิดแถบดำอีกเด็ดขาด)
+    final_y = min(current_y + 10, img.size[1])
+    return img.crop((0, 0, img_width, final_y))
 
 def create_receipt_copy_image(order): return generate_receipt_graphic(order, "RECEIPT/ORDER (COPY)")
 def create_receipt_image(order): return generate_receipt_graphic(order, "RECEIPT/ORDER")
