@@ -6,12 +6,14 @@ from zoneinfo import ZoneInfo
 from escpos.printer import Network
 from PIL import Image, ImageDraw, ImageFont
 import requests
+import qrcode 
 
 # ==============================================================================
 # CONFIGURATION
 # ==============================================================================
 
-VERCEL_API_URL = "/api"
+#VERCEL_API_URL = "/api"
+VERCEL_API_URL = "http://localhost:8000/api"
 PRINTER_IP = "192.168.1.87"  # IP เครื่องพิมพ์ Worrex Wi-Fi
 
 try:
@@ -35,6 +37,45 @@ try:
 except Exception as e:
     print(f"[Warning] โหลดฟอนต์ระบบไม่สำเร็จ ใช้ฟอนต์เริ่มต้น: {e}")
     font_title = font_bold = font_normal = font_small = ImageFont.load_default()
+
+# ==============================================================================
+# CREATE QRCODE ----------------------------------------------------------------
+def crc16_ccitt(data: bytes) -> str:
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= (byte << 8)
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
+            else:
+                crc = (crc << 1) & 0xFFFF
+    return f"{crc:04X}"
+
+def generate_promptpay_qr_image(phone_number: str, amount: float) -> Image.Image:
+    # แปลงเบอร์โทร 088-451-XXXX เป็นรูปแบบ 006688451XXXX
+    clean_phone = phone_number.replace("-", "").strip()
+    if clean_phone.startswith("0"):
+        clean_phone = "0066" + clean_phone[1:]
+    
+    # โครงสร้างมาตรฐาน EMVCo PromptPay
+    merchant_info = f"0016A0000006770101110113{clean_phone}"
+    merchant_tag = f"29{len(merchant_info):02d}{merchant_info}"
+    
+    amount_str = f"{amount:.2f}"
+    amount_tag = f"54{len(amount_str):02d}{amount_str}"
+    
+    payload = f"000201010212{merchant_tag}5303764{amount_tag}5802TH6304"
+    checksum = crc16_ccitt(payload.encode('ascii'))
+    full_payload = payload + checksum
+
+    # สร้างภาพ QR Code
+    qr = qrcode.QRCode(version=1, box_size=10, border=2)
+    qr.add_data(full_payload)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white").convert("L")
+    
+    # ปรับขนาดให้กว้าง 280px เท่ากับรูป QR เดิม
+    return img.resize((280, 280), Image.Resampling.LANCZOS)
 
 # ==============================================================================
 # GRAPHIC GENERATION FUNCTIONS
@@ -100,13 +141,23 @@ def create_order_ticket(order):
         current_y += 26
     return img.crop((0, 0, img_width, current_y + 10))
 
-
+#======================================================================
+# modify qrcode and promptpay -----------------------------------------
 def generate_receipt_graphic(order, title):
     img_width = 576  
     margin = 20
     lines = []
     logo_img, qrcode_img = None, None
+     
+    # ตั้งค่าข้อมูลพร้อมเพย์ (แก้เลข XXXX เป็นเบอร์จริงของคุณ)
+    PROMPTPAY_PHONE = "080-XXX-5111"
+    PROMPTPAY_NAME = "นาย อรรถกร เสนาะกรรณ์"
     
+    # รับค่าเงื่อนไข selectqrcode
+    select_qr = 'Y'
+    net_total = float(order.get('grandtotal_price', order.get('total_price', 0)))
+
+    # โหลดโลโก้ร้าน
     if os.path.exists(logo_path):
         try:
             logo = Image.open(logo_path).convert("L")
@@ -116,15 +167,23 @@ def generate_receipt_graphic(order, title):
             logo_img = logo
         except Exception as e: print(f"[Error] โหลดโลโก้ไม่สำเร็จ: {e}")
     
-    if os.path.exists(qrcode_path):
+    # ตรวจสอบเงื่อนไข selectqrcode
+    if select_qr == 'Y':
+        if os.path.exists(qrcode_path):
+            try:
+                qr = Image.open(qrcode_path).convert("L")
+                qr_width = 280
+                wpercent = qr_width / float(qr.size[0])
+                qr_height = int(float(qr.size[1]) * float(wpercent))
+                qrcode_img = qr.resize((qr_width, qr_height), Image.Resampling.LANCZOS)
+            except Exception as e:
+                print(f"[Error] โหลด QR Code ไม่สำเร็จ: {e}")
+    elif select_qr == 'N':
         try:
-            qr = Image.open(qrcode_path).convert("L")
-            qr_width = 280
-            wpercent = qr_width / float(qr.size[0])
-            qr_height = int(float(qr.size[1]) * float(wpercent))
-            qrcode_img = qr.resize((qr_width, qr_height), Image.Resampling.LANCZOS)
+            # สร้าง QR พร้อมเพย์ตามยอดเงินสุทธิ (net_total)
+            qrcode_img = generate_promptpay_qr_image(PROMPTPAY_PHONE, net_total)
         except Exception as e:
-            print(f"[Error] โหลด QR Code ไม่สำเร็จ: {e}")
+            print(f"[Error] สร้าง PromptPay QR ไม่สำเร็จ: {e}")
 
     lines.extend([("center", "\n", font_normal), ("center", title, font_title if "COPY" in title else font_normal), ("center", "-" * 66, font_normal)])
     dt_th = datetime.datetime.fromisoformat(order.get('created_at', '').replace('Z', '+00:00')).astimezone(ZoneInfo("Asia/Bangkok")).strftime("%d/%m/%Y %H:%M:%S")
@@ -157,11 +216,15 @@ def generate_receipt_graphic(order, title):
     if order.get('notes'): lines.extend([("center", "-" * 66, font_normal), ("left", f"📌 Notes: {order['notes']}", font_normal)])
     lines.extend([("center", "\n", font_normal), ("center", "-" * 48, font_normal), ("center", "*** Thank you ***", font_small), ("center", "\n", font_normal), ("center", "IG/FB: Wimuti Bake & Drip", font_small), ("center", "\n", font_normal)])
 
+    #=====================================================================================
+    # คำนวณความสูงกระดาษ (เพิ่มพื้นที่เผื่อข้อความชื่อและเบอร์โทรอีก 65px กรณี selectqrcode == 'N')
+    extra_qr_text_h = 65 if (select_qr == 'N' and qrcode_img) else 0
     logo_h = logo_img.size[1] if logo_img else 0
     qr_h = qrcode_img.size[1] if qrcode_img else 0
     img = Image.new('RGB', (img_width, len(lines) * 24 + 60 + logo_h + qr_h), color='white')
     d = ImageDraw.Draw(img)
     current_y = margin
+
     if logo_img:
         img.paste(logo_img, (int((img_width - logo_img.size[0]) / 2), int(current_y)))
         current_y += logo_img.size[1] + 15
@@ -177,9 +240,32 @@ def generate_receipt_graphic(order, title):
             bbox = d.textbbox((0, 0), right_txt, font=font)
             d.text((img_width - margin - (bbox[2] - bbox[0]), current_y), right_txt, fill='black', font=font)
         current_y += 24
+
+    #==========================================================================
+    # วาดรูป QR Code และข้อความด้านล่าง
     if qrcode_img:
         img.paste(qrcode_img, (int((img_width - qrcode_img.size[0]) / 2), int(current_y + 5)))
         current_y += qrcode_img.size[1] + 10
+        
+        # ถ้าเป็นพร้อมเพย์ ('N') ให้พิมพ์ชื่อและเบอร์โทรต่อท้ายด้านล่าง
+        if select_qr == 'N':
+            # บรรทัดที่ 1: ชื่อ
+            bbox1 = d.textbbox((0, 0), PROMPTPAY_NAME, font=font_bold)
+            d.text(((img_width - (bbox1[2] - bbox1[0])) / 2, current_y), PROMPTPAY_NAME, fill='black', font=font_bold)
+            current_y += 26
+
+            # บรรทัดที่ 2: เบอร์มือถือ
+            phone_info = f"เบอร์มือถือ"
+            bbox2 = d.textbbox((0, 0), phone_info, font=font_normal)
+            d.text(((img_width - (bbox2[2] - bbox2[0])) / 2, current_y), phone_info, fill='black', font=font_normal)
+            current_y += 26    
+
+            # บรรทัดที่ 3: หมายเลข
+            phone_display = f"โทร: {PROMPTPAY_PHONE}"
+            bbox3 = d.textbbox((0, 0), phone_display, font=font_normal)
+            d.text(((img_width - (bbox3[2] - bbox3[0])) / 2, current_y), phone_display, fill='black', font=font_normal)
+            current_y += 26
+
     return img.crop((0, 0, img_width, current_y + 10))
 
 def create_receipt_copy_image(order): return generate_receipt_graphic(order, "RECEIPT/ORDER (COPY)")
