@@ -39,45 +39,6 @@ except Exception as e:
     font_title = font_bold = font_normal = font_small = ImageFont.load_default()
 
 # ==============================================================================
-# CREATE QRCODE ----------------------------------------------------------------
-def crc16_ccitt(data: bytes) -> str:
-    crc = 0xFFFF
-    for byte in data:
-        crc ^= (byte << 8)
-        for _ in range(8):
-            if crc & 0x8000:
-                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
-            else:
-                crc = (crc << 1) & 0xFFFF
-    return f"{crc:04X}"
-
-def generate_promptpay_qr_image(phone_number: str, amount: float) -> Image.Image:
-    # แปลงเบอร์โทร 088-451-XXXX เป็นรูปแบบ 006688451XXXX
-    clean_phone = phone_number.replace("-", "").strip()
-    if clean_phone.startswith("0"):
-        clean_phone = "0066" + clean_phone[1:]
-    
-    # โครงสร้างมาตรฐาน EMVCo PromptPay
-    merchant_info = f"0016A0000006770101110113{clean_phone}"
-    merchant_tag = f"29{len(merchant_info):02d}{merchant_info}"
-    
-    amount_str = f"{amount:.2f}"
-    amount_tag = f"54{len(amount_str):02d}{amount_str}"
-    
-    payload = f"000201010212{merchant_tag}5303764{amount_tag}5802TH6304"
-    checksum = crc16_ccitt(payload.encode('ascii'))
-    full_payload = payload + checksum
-
-    # สร้างภาพ QR Code
-    qr = qrcode.QRCode(version=1, box_size=10, border=2)
-    qr.add_data(full_payload)
-    qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white").convert("L")
-    
-    # ปรับขนาดให้กว้าง 280px เท่ากับรูป QR เดิม
-    return img.resize((280, 280), Image.Resampling.LANCZOS)
-
-# ==============================================================================
 # GRAPHIC GENERATION FUNCTIONS
 # ==============================================================================
 def create_order_ticket(order):
@@ -141,6 +102,45 @@ def create_order_ticket(order):
         current_y += 26
     return img.crop((0, 0, img_width, current_y + 10))
 
+# ==============================================================================
+# CREATE Qrcode promptpay ----------------------------------------------------------------
+def crc16_ccitt(data: bytes) -> str:
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= (byte << 8)
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
+            else:
+                crc = (crc << 1) & 0xFFFF
+    return f"{crc:04X}"
+
+def generate_promptpay_qr_image(phone_number: str, amount: float) -> Image.Image:
+    # แปลงเบอร์โทร 088-451-XXXX เป็นรูปแบบ 006688451XXXX
+    clean_phone = phone_number.replace("-", "").strip()
+    if clean_phone.startswith("0"):
+        clean_phone = "0066" + clean_phone[1:]
+    
+    # โครงสร้างมาตรฐาน EMVCo PromptPay
+    merchant_info = f"0016A0000006770101110113{clean_phone}"
+    merchant_tag = f"29{len(merchant_info):02d}{merchant_info}"
+    
+    amount_str = f"{amount:.2f}"
+    amount_tag = f"54{len(amount_str):02d}{amount_str}"
+    
+    payload = f"000201010212{merchant_tag}5303764{amount_tag}5802TH6304"
+    checksum = crc16_ccitt(payload.encode('ascii'))
+    full_payload = payload + checksum
+
+    # สร้างภาพ QR Code
+    qr = qrcode.QRCode(version=1, box_size=10, border=2)
+    qr.add_data(full_payload)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white").convert("L")
+    
+    # ปรับขนาดให้กว้าง 280px เท่ากับรูป QR เดิม
+    return img.resize((280, 280), Image.Resampling.LANCZOS)
+
 #======================================================================
 # modify qrcode and promptpay -----------------------------------------
 def generate_receipt_graphic(order, title):
@@ -153,8 +153,8 @@ def generate_receipt_graphic(order, title):
     PROMPTPAY_PHONE = "080-XXX-5111"
     PROMPTPAY_NAME = "นาย อรรถกร เสนาะกรรณ์"
     
-    # รับค่าเงื่อนไข selectqrcode
-    select_qr = 'Y'
+    # รับค่าเงื่อนไข selectqrcode --'N'=promptpay -----------------
+    select_qr = 'N'
     net_total = float(order.get('grandtotal_price', order.get('total_price', 0)))
 
     # โหลดโลโก้ร้าน
