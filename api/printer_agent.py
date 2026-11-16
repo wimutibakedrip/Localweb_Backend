@@ -50,12 +50,12 @@ def create_order_ticket(order):
     lines.append(("center", "** ORDER TICKET **", font_title))
     lines.append(("center", "-" * 66, font_normal))
     
-    order_id = order.get('orderid', '-')
+    order_id = order.get('orderid') or f"#{order.get('id', '-')}"
     created_at = order.get('created_at', '')
     customer_name = order.get('customer_name') or 'หน้าร้าน'
     dt_th = datetime.datetime.fromisoformat(created_at.replace('Z', '+00:00')).astimezone(ZoneInfo("Asia/Bangkok")).strftime("%d/%m/%Y %H:%M:%S")
 
-    lines.append(("left_right", (f"Order : ", f"#{order_id}"), font_bold))
+    lines.append(("left_right", (f"Order : ", f"{order_id}"), font_bold))
     lines.append(("left_right", (f"เวลา : ", f"{dt_th}"), font_normal))
     lines.append(("left", f"ลูกค้า: {customer_name}", font_bold))
     lines.append(("center", "-" * 66, font_normal))
@@ -185,9 +185,10 @@ def generate_receipt_graphic(order, title):
         except Exception as e:
             print(f"[Error] สร้าง PromptPay QR ไม่สำเร็จ: {e}")
 
+    display_order_id = order.get('orderid') or f"#{order.get('id', '-')}"
     lines.extend([("center", "\n", font_normal), ("center", title, font_title if "COPY" in title else font_normal), ("center", "-" * 66, font_normal)])
     dt_th = datetime.datetime.fromisoformat(order.get('created_at', '').replace('Z', '+00:00')).astimezone(ZoneInfo("Asia/Bangkok")).strftime("%d/%m/%Y %H:%M:%S")
-    lines.extend([("left_right", ("Order : ", f"#{order.get('id', '-')}"), font_normal), ("left_right", ("เวลา : ", f"{dt_th}"), font_normal), ("left_right", (f"ลูกค้า: {order.get('customer_name') or 'หน้าร้าน'}", f"ชำระ: {order.get('payment_method') or '-'}"), font_normal), ("center", "-" * 66, font_normal), ("left_right", ("Qty x Description", "Total"), font_normal), ("center", "-" * 66, font_normal)])
+    lines.extend([("left_right", ("Order : ", f"{display_order_id}"), font_normal), ("left_right", ("เวลา : ", f"{dt_th}"), font_normal), ("left_right", (f"ลูกค้า: {order.get('customer_name') or 'หน้าร้าน'}", f"ชำระ: {order.get('payment_method') or '-'}"), font_normal), ("center", "-" * 66, font_normal), ("left_right", ("Qty x Description", "Total"), font_normal), ("center", "-" * 66, font_normal)])
     
     raw_items = order.get('items') or order.get('order_items') or []
     def get_item_name(item):

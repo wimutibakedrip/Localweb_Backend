@@ -57,6 +57,7 @@ async def optimized_printer_loop():
                 # แปลง SQLAlchemy Object เป็น Dict ชั่วคราวเพื่อส่งให้ฟังก์ชันพิมพ์เดิมของ agent.py
                 order_dict = {
                     "id": order.id,
+                    "orderid": order.orderid,
                     "customer_name": order.customer_name,
                     "subtotal_price": order.subtotal_price,
                     "discount_price": order.discount_price,
