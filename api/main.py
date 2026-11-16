@@ -318,7 +318,11 @@ def create_order(request: OrderCreateRequest, db: Session = Depends(get_db)):
     grandtotal_price = max(0.0, subtotal_price - discount_amount)
     thailand_now = datetime.datetime.now(ZoneInfo("Asia/Bangkok"))
 
+    # เรียกใช้ฟังก์ชันสร้าง orderid
+    generated_order_id = generate_daily_order_id(db, thailand_now)
+
     new_order = models.OrderModel(
+        orderid=generated_order_id,
         customer_name=request.customer_name, subtotal_price=subtotal_price,
         discount_price=discount_amount, grandtotal_price=grandtotal_price,
         status=models.OrderStatus.PENDING, notes=request.notes,
@@ -334,6 +338,29 @@ def create_order(request: OrderCreateRequest, db: Session = Depends(get_db)):
         
     from fastapi.encoders import jsonable_encoder
     return jsonable_encoder(new_order)
+
+# ฟังก์ชันสำหรับสร้างรหัส OrderID ประจำวัน
+def generate_daily_order_id(db: Session, current_dt: datetime.datetime) -> str:
+    date_str = current_dt.strftime("%Y%m%d")
+    prefix = f"W-{date_str}-"
+    
+    # ค้นหาออเดอร์ล่าสุดของวันนั้น และใช้ with_for_update() ล็อกแถวป้องกันเลขซ้ำกันกรณีสั่งพร้อมกัน
+    last_order = db.query(models.OrderModel)\
+                   .filter(models.OrderModel.orderid.like(f"{prefix}%"))\
+                   .order_by(models.OrderModel.id.desc())\
+                   .with_for_update()\
+                   .first()
+                   
+    if last_order and last_order.orderid:
+        # ตัดเอาเฉพาะตัวเลขด้านหลังสุด (เช่น 639168) มาบวก 1
+        last_running_num = int(last_order.orderid.split("-")[-1])
+        next_num = last_running_num + 1
+    else:
+        # ถ้ายังไม่มีออเดอร์ของวันนี้ ให้เริ่มต้นที่ 639168
+        next_num = 639168
+        
+    return f"{prefix}{next_num}"
+
 
 # ฟังก์ชันดึงออเดอร์คิวครัว
 @app.get("/api/orders")
@@ -595,6 +622,7 @@ def get_requested_print_orders(db: Session = Depends(get_db)):
     for order in orders:
         order_dict = {
             "id": order.id, 
+            "orderid": order.orderid,
             "customer_name": order.customer_name, 
             "subtotal_price": order.subtotal_price,
             "discount_price": order.discount_price, 

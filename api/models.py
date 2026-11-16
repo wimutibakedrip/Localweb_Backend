@@ -51,6 +51,7 @@ class OrderModel(Base):
     is_print_order = Column(Boolean, default=False)
     is_print_receipt = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), default=get_thailand_time)
+    orderid = Column(String, unique=True, index=True, nullable=False, default="W-20261115-289168")
 
     # ความสัมพันธ์เชื่อมต่อไปหา OrderItemModel
     items = relationship("OrderItemModel", back_populates="order", cascade="all, delete-orphan")
@@ -82,7 +83,7 @@ class ProductCreate(BaseModel):
     desc: str = ""
     is_active: bool = True
 
-    # 💡 ย้ายคลาส Config เข้ามาอยู่ในรูปแบบข้อกำหนดของ Pydantic
+    # ย้ายคลาส Config เข้ามาอยู่ในรูปแบบข้อกำหนดของ Pydantic
     class Config:
         from_attributes = True
 

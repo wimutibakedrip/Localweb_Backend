@@ -50,7 +50,7 @@ def create_order_ticket(order):
     lines.append(("center", "** ORDER TICKET **", font_title))
     lines.append(("center", "-" * 66, font_normal))
     
-    order_id = order.get('id', '-')
+    order_id = order.get('orderid', '-')
     created_at = order.get('created_at', '')
     customer_name = order.get('customer_name') or 'หน้าร้าน'
     dt_th = datetime.datetime.fromisoformat(created_at.replace('Z', '+00:00')).astimezone(ZoneInfo("Asia/Bangkok")).strftime("%d/%m/%Y %H:%M:%S")
