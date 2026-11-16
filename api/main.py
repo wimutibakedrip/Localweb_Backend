@@ -384,7 +384,7 @@ def get_all_orders(selected_date: Optional[str] = Query(None, description="YYYY-
     result = []
     for order in orders:
         order_dict = {
-            "id": order.id, "customer_name": order.customer_name, "subtotal_price": order.subtotal_price,
+            "id": order.id, "orderid": order.orderid, "customer_name": order.customer_name, "subtotal_price": order.subtotal_price,
             "discount_price": order.discount_price, "grandtotal_price": order.grandtotal_price,
             "status": order.status.value if hasattr(order.status, 'value') else order.status,
             "notes": order.notes, "payment_method": order.payment_method,
