@@ -400,7 +400,7 @@ def update_order_status(order_id: int, request: OrderStatusUpdateRequest, db: Se
         raise HTTPException(status_code=404, detail="ไม่พบรายการออเดอร์นี้ในคิว")
         
     current_status_str = order.status.value if hasattr(order.status, 'value') else str(order.status)
-    if current_status_str in ["สำเร็จ", "ยกเลิก"]:
+    if current_status_str in ["ยกเลิก"]:
         raise HTTPException(status_code=400, detail="ไม่สามารถเปลี่ยนสถานะออเดอร์ที่สิ้นสุดแล้วได้")
     
     matched_status = None
@@ -497,7 +497,6 @@ def get_product_buyers(
     # แปลงผลลัพธ์เป็นโครงสร้าง Array Object ส่งกลับไปให้ React (เปลี่ยนจาก b.quantity เป็น b.total_qty ตามคีย์ใหม่)
     return [{"customer_name": b.customer_name or "ไม่ระบุชื่อ/หน้าร้าน", "qty": int(b.total_qty)} for b in buyers]
 
-
 # ---------------------------------------------------------------------------------------------------------------
 # API สำหรับอัปเดตแก้ไขรายการออเดอร์เดิมจากตะกร้า
 @app.put("/api/orders/{order_id}")
@@ -507,7 +506,7 @@ def update_existing_order(order_id: int, request: OrderCreateRequest, db: Sessio
         raise HTTPException(status_code=404, detail="ไม่พบรายการออเดอร์ใบนี้ในระบบ")
 
     current_status_str = order.status.value if hasattr(order.status, 'value') else str(order.status)
-    if current_status_str in ["สำเร็จ", "ยกเลิก"]:
+    if current_status_str in ["ยกเลิก"]:
         raise HTTPException(status_code=400, detail="ไม่สามารถแก้ไขออเดอร์ใบนี้ได้แล้ว")
 
     # คืนสต็อกชั่วคราว
