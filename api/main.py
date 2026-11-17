@@ -452,14 +452,28 @@ def get_sales_summary(selected_date: Optional[str] = Query(None, description="YY
         status_distribution[status_str] = count
 
     # เลือก 20 top รายการล่าสุด -------------------------------------------
-    rec_limit = 20
-    top_items = db.query(models.OrderItemModel.product_id, func.sum(models.OrderItemModel.quantity).label("total_qty")).join(models.OrderModel).filter(date_filter).filter(models.OrderModel.status == models.OrderStatus.COMPLETED).group_by(models.OrderItemModel.product_id).order_by(func.sum(models.OrderItemModel.quantity).desc()).limit(rec_limit).all()
-     
-    top_products_list = []
-    for item in top_items:
-        prod = db.query(models.ProductModel).filter(models.ProductModel.id == item.product_id).first()
-        if prod:
-            top_products_list.append({"name": prod.name, "qty": int(item.total_qty), "category": prod.category})
+    # Join ตาราง ProductModel ตั้งแต่แรก ไม่ต้องวนลูป query ซ้ำ 20 ครั้ง
+    top_items = db.query(
+        models.ProductModel.name,
+        models.ProductModel.category,
+        models.ProductModel.price,
+        func.sum(models.OrderItemModel.quantity).label("total_qty")
+    ).join(models.OrderItemModel, models.OrderItemModel.product_id == models.ProductModel.id)\
+    .join(models.OrderModel, models.OrderItemModel.order_id == models.OrderModel.id)\
+    .filter(date_filter)\
+    .filter(models.OrderModel.status == models.OrderStatus.COMPLETED)\
+    .group_by(models.ProductModel.id)\
+    .order_by(func.sum(models.OrderItemModel.quantity).desc())\
+    .limit(20).all()
+
+    top_products_list = [
+        {
+            "name": item.name,
+            "qty": int(item.total_qty),
+            "category": item.category,
+            "total_amount": float(item.price * int(item.total_qty))
+        } for item in top_items
+    ]
 
     return {
         "total_revenue": float(total_revenue), "total_cash": float(total_cash), "total_transfer": float(total_transfer),
