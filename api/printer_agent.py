@@ -149,8 +149,9 @@ def generate_receipt_graphic(order, title):
     lines = []
     logo_img, qrcode_img = None, None
      
-    # ตั้งค่าข้อมูลพร้อมเพย์ (แก้เลข XXXX เป็นเบอร์จริงของคุณ)
-    PROMPTPAY_PHONE = "080-XXX-5111"
+    # ตั้งค่าข้อมูลพร้อมเพย์
+    PROMPTPAY_PHONE = "080-956-5111"
+    PROMPTPAY_PHONE_DIS = "080-XXX-5111"
     PROMPTPAY_NAME = "นาย อรรถกร เสนาะกรรณ์"
     
     # รับค่าเงื่อนไข selectqrcode --'N'=promptpay -----------------
@@ -253,9 +254,6 @@ def generate_receipt_graphic(order, title):
         current_y += qrcode_img.size[1] + 15  # เว้นระยะห่างใต้รูป QR Code 15px
         
         if select_qr == 'N':
-            PROMPTPAY_NAME = "นายอรรถกร เสนาะกรรณ์"
-            phone_display = f"{PROMPTPAY_PHONE}"
-
             # บรรทัดที่ 1: ชื่อ-นามสกุล (ระบุ Index [2] และ [0] ให้ครบ)
             bbox1 = d.textbbox((0, 0), PROMPTPAY_NAME, font=font_bold)
             text_w1 = bbox1[2] - bbox1[0]
@@ -263,9 +261,9 @@ def generate_receipt_graphic(order, title):
             current_y += 28
             
             # บรรทัดที่ 2: เบอร์โทร
-            bbox2 = d.textbbox((0, 0), phone_display, font=font_normal)
+            bbox2 = d.textbbox((0, 0), PROMPTPAY_PHONE_DIS, font=font_normal)
             text_w2 = bbox2[2] - bbox2[0]
-            d.text(((img_width - text_w2) / 2, current_y), phone_display, fill='black', font=font_normal)
+            d.text(((img_width - text_w2) / 2, current_y), PROMPTPAY_PHONE_DIS, fill='black', font=font_normal)
             current_y += 28
 
     # ป้องกันการ Crop เกินความสูงจริงของรูป (ไม่ให้เกิดแถบดำอีกเด็ดขาด)
