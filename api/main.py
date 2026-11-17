@@ -140,10 +140,6 @@ async def optimized_printer_loop():
                 if await asyncio.to_thread(print_sales_report_to_worrex, report_job_data):
                     sales_report_queue.pending_reports = [r for r in sales_report_queue.pending_reports if r["id"] != job_id]
 
-
-                if print_sales_report_to_worrex(report_job_data):
-                    sales_report_queue.pending_reports = [r for r in sales_report_queue.pending_reports if r["id"] != job_id]
-
         except asyncio.CancelledError:
             print("[*] ฮาร์ดแวร์ Pi 4: ปิดระบบ Background Printer Task เรียบร้อย")
             raise  # ส่งต่อสัญญาณให้ Task จบการทำงานอย่างสมบูรณ์
