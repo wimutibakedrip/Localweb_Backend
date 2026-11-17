@@ -107,21 +107,39 @@ async def optimized_printer_loop():
                 total_discount = db.query(func.sum(models.OrderModel.discount_price)).filter(date_filter).filter(models.OrderModel.status == models.OrderStatus.COMPLETED).scalar() or 0.0
                 completed_orders_count = db.query(func.count(models.OrderModel.id)).filter(date_filter).filter(models.OrderModel.status == models.OrderStatus.COMPLETED).scalar() or 0.0
                 
-                top_items = db.query(models.OrderItemModel.product_id, func.sum(models.OrderItemModel.quantity).label("total_qty")).join(models.OrderModel).filter(date_filter).filter(models.OrderModel.status == models.OrderStatus.COMPLETED).group_by(models.OrderItemModel.product_id).order_by(func.sum(models.OrderItemModel.quantity).desc()).limit(20).all()
-                
-                top_products_list = []
-                for item in top_items:
-                    prod = db.query(models.ProductModel).filter(models.ProductModel.id == item.product_id).first()
-                    if prod:
-                        top_products_list.append({
-                            "name": prod.name, "qty": int(item.total_qty), "category": prod.category, "total_amount": float(prod.price * int(item.total_qty))
-                        })
+                # ใช้แทนที่ส่วน top_items และ top_products_list ใน optimized_printer_loop()
+                top_items = db.query(
+                    models.ProductModel.name,
+                    models.ProductModel.category,
+                    models.ProductModel.price,
+                    func.sum(models.OrderItemModel.quantity).label("total_qty")
+                ).join(models.OrderItemModel, models.OrderItemModel.product_id == models.ProductModel.id)\
+                 .join(models.OrderModel, models.OrderItemModel.order_id == models.OrderModel.id)\
+                 .filter(date_filter)\
+                 .filter(models.OrderModel.status == models.OrderStatus.COMPLETED)\
+                 .group_by(models.ProductModel.id)\
+                 .order_by(func.sum(models.OrderItemModel.quantity).desc())\
+                 .limit(20).all()
+
+                top_products_list = [
+                    {
+                        "name": item.name,
+                        "qty": int(item.total_qty),
+                        "category": item.category,
+                        "total_amount": float(item.price * int(item.total_qty))
+                    } for item in top_items
+                ]
 
                 report_job_data = {
                     "job_id": job_id, "start_date": start_date.strftime("%d/%m/%Y"), "end_date": end_date.strftime("%d/%m/%Y"),
                     "total_revenue": float(total_revenue), "total_orders": int(completed_orders_count), "total_cash": float(total_cash),
                     "total_transfer": float(total_transfer), "total_discount": float(total_discount), "top_products": top_products_list
                 }
+
+                # ใช้ asyncio.to_thread เพื่อไม่ให้การพิมพ์รายงานไปบล็อกการทำงานของ API
+                if await asyncio.to_thread(print_sales_report_to_worrex, report_job_data):
+                    sales_report_queue.pending_reports = [r for r in sales_report_queue.pending_reports if r["id"] != job_id]
+
 
                 if print_sales_report_to_worrex(report_job_data):
                     sales_report_queue.pending_reports = [r for r in sales_report_queue.pending_reports if r["id"] != job_id]
@@ -703,7 +721,6 @@ def request_print_sales_report(selected_date: str = Query(..., description="YYYY
 # 2. API ให้ Local Printer Agent ยิงมาสแกนตรวจหาคิวงานพิมพ์รายงานยอดขายที่ค้างอยู่
 @app.get("/api/sales/pending-print-report")
 def get_pending_print_sales_reports(db: Session = Depends(get_db)):
-    
     if not sales_report_queue.pending_reports:
         return []
     
@@ -723,24 +740,28 @@ def get_pending_print_sales_reports(db: Session = Depends(get_db)):
     total_discount = db.query(func.sum(models.OrderModel.discount_price)).filter(date_filter).filter(models.OrderModel.status == models.OrderStatus.COMPLETED).scalar() or 0.0
     completed_orders_count = db.query(func.count(models.OrderModel.id)).filter(date_filter).filter(models.OrderModel.status == models.OrderStatus.COMPLETED).scalar() or 0
     
-    # 20 อันดับสินค้าขายดี พร้อมคำนวณยอดเงินรวมของแต่ละสินค้าเพิ่มเติม (ราคาคูณจำนวน)
+    # [จุดที่แก้ไข] ยุบ Query 20 รอบให้เหลือคำสั่งเดียวด้วยการ join ProductModel
     top_items = db.query(
-        models.OrderItemModel.product_id, 
+        models.ProductModel.name,
+        models.ProductModel.category,
+        models.ProductModel.price,
         func.sum(models.OrderItemModel.quantity).label("total_qty")
-    ).join(models.OrderModel).filter(date_filter).filter(models.OrderModel.status == models.OrderStatus.COMPLETED).group_by(models.OrderItemModel.product_id).order_by(func.sum(models.OrderItemModel.quantity).desc()).limit(20).all()
-    
-    top_products_list = []
-    for item in top_items:
-        prod = db.query(models.ProductModel).filter(models.ProductModel.id == item.product_id).first()
-        if prod:
-            # คำนวณราคารวมที่ขายได้ของสินค้านั้น ๆ ในรอบสัปดาห์
-            total_item_sales_amount = prod.price * int(item.total_qty)
-            top_products_list.append({
-                "name": prod.name, 
-                "qty": int(item.total_qty), 
-                "category": prod.category,
-                "total_amount": float(total_item_sales_amount)
-            })
+    ).join(models.OrderItemModel, models.OrderItemModel.product_id == models.ProductModel.id)\
+     .join(models.OrderModel, models.OrderItemModel.order_id == models.OrderModel.id)\
+     .filter(date_filter)\
+     .filter(models.OrderModel.status == models.OrderStatus.COMPLETED)\
+     .group_by(models.ProductModel.id)\
+     .order_by(func.sum(models.OrderItemModel.quantity).desc())\
+     .limit(20).all()
+
+    top_products_list = [
+        {
+            "name": item.name,
+            "qty": int(item.total_qty),
+            "category": item.category,
+            "total_amount": float(item.price * int(item.total_qty))
+        } for item in top_items
+    ]
 
     # ส่งข้อมูลสรุปที่สมบูรณ์กลับไปให้ Agent วาดรูปกราฟิกเพื่อพิมพ์ลงกระดาษความร้อน
     return [{
@@ -789,19 +810,30 @@ def get_dashboard_analytics_report(selected_date: Optional[str] = Query(None), d
     cash_p = (t_cash / pay_sum * 100) if pay_sum > 0 else 0
     transfer_p = (t_transfer / pay_sum * 100) if pay_sum > 0 else 0
 
-    # 4. เจาะสถิติตัวเลขรายวันย้อนหลัง 7 วันเพื่อทำกราฟเส้น/แท่ง
+    # 4. เจาะสถิติตัวเลขรายวันย้อนหลัง 7 วัน (ยิง Query ครั้งเดียวด้วย GROUP BY แทนการวนลูป 7 รอบ)
+    daily_rows = db.query(
+        local_order_date.label("order_day"),
+        func.sum(models.OrderModel.grandtotal_price).label("day_rev")
+    ).filter(date_filter)\
+     .filter(models.OrderModel.status == models.OrderStatus.COMPLETED)\
+     .group_by(local_order_date).all()
+
+    # แปลงผลลัพธ์เป็น Dict เพื่อง่ายต่อการค้นหาตามวันที่
+    daily_rev_map = {row.order_day: float(row.day_rev or 0.0) for row in daily_rows}
+
     daily_trend_list = []
     max_daily_rev = 1.0 # ใช้ดักการหารเป็นศูนย์
     
     for i in range(7):
         current_day = start_date + datetime.timedelta(days=i)
-        day_rev = db.query(func.sum(models.OrderModel.grandtotal_price)).filter(local_order_date == current_day).filter(models.OrderModel.status == models.OrderStatus.COMPLETED).scalar() or 0.0
+        day_rev = daily_rev_map.get(current_day, 0.0)
         if day_rev > max_daily_rev:
             max_daily_rev = day_rev
-        daily_trend_list.append({"date": current_day.strftime("%a (%d)"), "revenue": float(day_rev)})
+        daily_trend_list.append({"date": current_day.strftime("%a (%d)"), "revenue": day_rev})
         
     for day_data in daily_trend_list:
         day_data["percent"] = (day_data["revenue"] / max_daily_rev) * 100
+
 
     # 5. สรุปชื่อลูกค้าขาประจำสั่งซื้อบ่อยและยอดเปย์สูงสุด (Top Loyalty Buyers)
     loyalty_buyers = db.query(
