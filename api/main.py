@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 import asyncio
 import datetime
 import time
@@ -14,20 +15,29 @@ from pydantic import BaseModel
 
 from . import models
 from .database import engine, get_db, SessionLocal
-# อิมพอร์ตฟังก์ชันวาดรูปและสั่งพิมพ์มาจาก agent.py เดิม
 from .printer_agent import print_receipt_to_worrex, print_sales_report_to_worrex
 
 models.Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="Wimuti Bakery API")
+# ประกาศ lifespan ก่อนสร้าง app
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    printer_task = asyncio.create_task(optimized_printer_loop())
+    yield
+    printer_task.cancel()
+    try:
+        await printer_task
+    except asyncio.CancelledError:
+        pass
+
+app = FastAPI(title="Wimuti Bakery API", lifespan=lifespan)
+
 origins =["http://localhost:5173", "*"]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,  
-    allow_credentials=True,
-    allow_methods=["*"], 
-    allow_headers=["*"],
+    allow_origins=origins, allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
 )
 
 UPLOAD_DIR = "uploads"
@@ -35,15 +45,13 @@ app.mount("/static-images", StaticFiles(directory=UPLOAD_DIR), name="static-imag
 
 # ==============================================================================
 # LOW-RESOURCE BACKGROUND PRINTER TASK (FOR RASPBERRY PI 4 1GB RAM)
-# ==============================================================================
 async def optimized_printer_loop():
     print("[*] ฮาร์ดแวร์ Pi 4: เริ่มต้นระบบ Background Printer Task (Direct DB Mode)")
     
     while True:
-        # ใช้ SessionLocal สร้าง Session สั้นๆ เพื่อป้องกันหน่วยความจำรั่ว (Memory Leak) บน RAM 1GB
         db: Session = SessionLocal()
         try:
-            # 1. คิวรีหาออเดอร์ที่สั่งพิมพ์โดยตรงจาก DB (ไม่ต้องผ่าน HTTP HTTP Request)
+            # คิวรีหาออเดอร์ที่สั่งพิมพ์โดยตรงจาก DB
             orders = db.query(models.OrderModel)\
                        .options(joinedload(models.OrderModel.items).joinedload(models.OrderItemModel.product))\
                        .filter(models.OrderModel.is_print_requested == True)\
@@ -52,9 +60,6 @@ async def optimized_printer_loop():
                        .all()
 
             for order in orders:
-                order_id = order.id
-                
-                # แปลง SQLAlchemy Object เป็น Dict ชั่วคราวเพื่อส่งให้ฟังก์ชันพิมพ์เดิมของ agent.py
                 order_dict = {
                     "id": order.id,
                     "orderid": order.orderid,
@@ -69,9 +74,8 @@ async def optimized_printer_loop():
                     "items": [{"quantity": item.quantity, "price": item.price, "custom_text": getattr(item, 'custom_text', None), "product": {"name": item.product.name if item.product else "สินค้า", "price": item.price}} for item in order.items]
                 }
 
-                # แยกพิมพ์ตามประเภท Flag
                 if order.is_print_order:
-                    success = print_receipt_to_worrex(order_dict, "order")
+                    success = await asyncio.to_thread(print_receipt_to_worrex, order_dict, "order")
                     if success:
                         order.is_print_requested = False
                         order.is_print_order = False
@@ -79,20 +83,19 @@ async def optimized_printer_loop():
                         db.commit()
 
                 elif order.is_print_receipt:
-                    success = print_receipt_to_worrex(order_dict, "receipt")
+                    success = await asyncio.to_thread(print_receipt_to_worrex, order_dict, "receipt")
                     if success:
                         order.is_print_requested = False
                         order.is_print_receipt = False
                         order.is_printed = True
                         db.commit()
 
-            # 2. ตรวจสอบคิวพิมพ์รายงานสรุปยอดขาย (In-Memory Queue)
+            # ตรวจสอบคิวพิมพ์รายงานสรุปยอดขาย
             if sales_report_queue.pending_reports:
                 current_job = sales_report_queue.pending_reports[0]
                 job_id = current_job["id"]
                 target_date = current_job["selected_date"]
 
-                # ดึงข้อมูลมาประมวลผลสรุปรายงาน
                 end_date = datetime.datetime.strptime(target_date, "%Y-%m-%d").date()
                 start_date = end_date - datetime.timedelta(days=6)
                 local_order_date = func.date(func.timezone('Asia/Bangkok', models.OrderModel.created_at))
@@ -102,7 +105,7 @@ async def optimized_printer_loop():
                 total_cash = db.query(func.sum(models.OrderModel.grandtotal_price)).filter(date_filter).filter(models.OrderModel.status == models.OrderStatus.COMPLETED).filter(models.OrderModel.payment_method == models.OrderPayment.CASH).scalar() or 0.0 
                 total_transfer = db.query(func.sum(models.OrderModel.grandtotal_price)).filter(date_filter).filter(models.OrderModel.status == models.OrderStatus.COMPLETED).filter(models.OrderModel.payment_method == models.OrderPayment.TRANSFER).scalar() or 0.0
                 total_discount = db.query(func.sum(models.OrderModel.discount_price)).filter(date_filter).filter(models.OrderModel.status == models.OrderStatus.COMPLETED).scalar() or 0.0
-                completed_orders_count = db.query(func.count(models.OrderModel.id)).filter(date_filter).filter(models.OrderModel.status == models.OrderStatus.COMPLETED).scalar() or 0
+                completed_orders_count = db.query(func.count(models.OrderModel.id)).filter(date_filter).filter(models.OrderModel.status == models.OrderStatus.COMPLETED).scalar() or 0.0
                 
                 top_items = db.query(models.OrderItemModel.product_id, func.sum(models.OrderItemModel.quantity).label("total_qty")).join(models.OrderModel).filter(date_filter).filter(models.OrderModel.status == models.OrderStatus.COMPLETED).group_by(models.OrderItemModel.product_id).order_by(func.sum(models.OrderItemModel.quantity).desc()).limit(20).all()
                 
@@ -120,34 +123,20 @@ async def optimized_printer_loop():
                     "total_transfer": float(total_transfer), "total_discount": float(total_discount), "top_products": top_products_list
                 }
 
-                # สั่งพิมพ์รายงาน
                 if print_sales_report_to_worrex(report_job_data):
-                    # ลบงานออกจากคิวเมื่อพิมพ์สำเร็จ
                     sales_report_queue.pending_reports = [r for r in sales_report_queue.pending_reports if r["id"] != job_id]
 
+        except asyncio.CancelledError:
+            print("[*] ฮาร์ดแวร์ Pi 4: ปิดระบบ Background Printer Task เรียบร้อย")
+            raise  # ส่งต่อสัญญาณให้ Task จบการทำงานอย่างสมบูรณ์
         except Exception as e:
+            db.rollback()  # เผื่อกรณี DB commit ค้างตอนเกิด Error
             print(f"[Warning] เครื่องพิมพ์ขัดข้องบน Pi 4: {e}")
         finally:
-            db.close() # ปิด Session ทุกครั้งเพื่อคืนหน่วยความจำให้ระบบ
+            db.close()  # ปิด Session ทุกครั้งเพื่อคืนหน่วยความจำให้ระบบ
         
-        # หน่วงเวลา 4 วินาที (ปรับเพิ่มเล็กน้อยเพื่อลดภาระ CPU ของ Pi 4 ตัวเล็ก)
         await asyncio.sleep(4)
 
-# สั่งให้ลูปทำงานแบบ Asynchronous เคียงข้างไปกับตัว API ทันทีเมื่อเปิดตัว Webserver
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(optimized_printer_loop())
-
-# ==============================================================================
-
-# CORS เพื่อให้ React สามารถยิง API มาหา FastAPI ได้
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,  
-    allow_credentials=True,
-    allow_methods=["*"], 
-    allow_headers=["*"],
-)
 
 # สำหรับฝั่ง ADMIN----------------------------------------------------------------
 class AdminLoginRequest(BaseModel):
@@ -231,7 +220,7 @@ async def update_product(
         file_location = f"{UPLOAD_DIR}/{clean_filename}"
         with open(file_location, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-        image_url = f"http://localhost:8000/static-images/{clean_filename}"
+        image_url = f"/static-images/{clean_filename}"
 
     db_product.name = name
     db_product.category = category

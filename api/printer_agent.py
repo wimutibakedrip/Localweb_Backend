@@ -100,7 +100,10 @@ def create_order_ticket(order):
             bbox = d.textbbox((0, 0), right_text, font=font)
             d.text((img_width - margin - (bbox[2] - bbox[0]), current_y), right_text, fill='black', font=font)
         current_y += 26
-    return img.crop((0, 0, img_width, current_y + 10))
+    
+    cropped_img = img.crop((0, 0, img_width, current_y + 10))
+    img.close()
+    return cropped_img
 
 # ==============================================================================
 # CREATE Qrcode promptpay ----------------------------------------------------------------
@@ -138,8 +141,9 @@ def generate_promptpay_qr_image(phone_number: str, amount: float) -> Image.Image
     qr.make(fit=True)
     img = qr.make_image(fill_color="black", back_color="white").convert("L")
     
-    # ปรับขนาดให้กว้าง 280px เท่ากับรูป QR เดิม
-    return img.resize((280, 280), Image.Resampling.LANCZOS)
+    resize_img = img.resize((280, 280), Image.Resampling.LANCZOS)
+    img.close()
+    return resize_img
 
 #======================================================================
 # modify qrcode and promptpay -----------------------------------------
@@ -268,7 +272,15 @@ def generate_receipt_graphic(order, title):
 
     # ป้องกันการ Crop เกินความสูงจริงของรูป (ไม่ให้เกิดแถบดำอีกเด็ดขาด)
     final_y = min(current_y + 10, img.size[1])
-    return img.crop((0, 0, img_width, final_y))
+    cropped_img = img.crop((0, 0, img_width, final_y))
+    # ปิดภาพย่อยและภาพหลักทั้งหมดหลังแปะและตัดรูปเสร็จแล้ว
+    if logo_img:
+        logo_img.close()
+    if qrcode_img:
+        qrcode_img.close()
+    img.close()
+    return cropped_img
+
 
 def create_receipt_copy_image(order): return generate_receipt_graphic(order, "RECEIPT/ORDER (COPY)")
 def create_receipt_image(order): return generate_receipt_graphic(order, "RECEIPT/ORDER")
@@ -277,10 +289,16 @@ def create_receipt_image(order): return generate_receipt_graphic(order, "RECEIPT
 # NETWORKING & AGENT SYSTEM LOOP
 # ==============================================================================
 def print_receipt_to_worrex(order, current_type):
+    printer = None
+    ticket_img = None
+    copy_img = None
+    receipt_img = None
     try:
         if current_type == "order":
             printer = Network(PRINTER_IP, port=9100, timeout=5, profile="TUP500")
-            printer.image(create_order_ticket(order))
+            ticket_img = create_order_ticket(order)
+            printer.image(ticket_img)
+            ticket_img.close()  # <--- สั่งปิดภาพตรงนี้ทันทีหลังส่งเข้าเครื่องพิมพ์!
             printer.cut()
             printer.close()  
             print(f"[-] พิมพ์ใบออเดอร์ ออเดอร์ #{order['id']} สำเร็จ")
@@ -290,7 +308,9 @@ def print_receipt_to_worrex(order, current_type):
         if current_type == "receipt":
             # 1. พิมพ์ใบสำเนา (Copy)
             printer = Network(PRINTER_IP, port=9100, timeout=15, profile="TUP500")
-            printer.image(create_receipt_copy_image(order))
+            copy_img = create_receipt_copy_image(order)
+            printer.image(copy_img)
+            copy_img.close()  # <--- สั่งปิดภาพใบสำเนา
             printer.cut()
             printer.close()
             print(f"[-] พิมพ์ใบเสร็จสำเนา ออเดอร์ #{order['id']} สำเร็จ")
@@ -298,7 +318,9 @@ def print_receipt_to_worrex(order, current_type):
 
             # 2. พิมพ์ใบต้นฉบับ
             printer = Network(PRINTER_IP, port=9100, timeout=15, profile="TUP500")
-            printer.image(create_receipt_image(order))
+            receipt_img = create_receipt_image(order)
+            printer.image(receipt_img)
+            receipt_img.close()  # <--- สั่งปิดภาพใบต้นฉบับ
             printer.cut()
             printer.close()
             print(f"[-] พิมพ์ใบเสร็จต้นฉบับ ออเดอร์ #{order['id']} สำเร็จ")
@@ -308,8 +330,19 @@ def print_receipt_to_worrex(order, current_type):
     except Exception as e:
         print(f"[Error] พิมพ์งานประเภท {current_type} ของออเดอร์ #{order.get('id')} ค้าง: {e}")
         return False
-        
-    return False
+    finally:
+        # ปิดทั้งรูปภาพและท่อเชื่อมต่อเครื่องพิมพ์เสมอ แม้เกิด Error
+        if ticket_img:
+            ticket_img.close()
+        if copy_img:
+            copy_img.close()
+        if receipt_img:
+            receipt_img.close()
+        if printer:
+            try:
+                printer.close()
+            except Exception:
+                pass
 
 # ฟังก์ชันสำหรับแปลงข้อมูลสรุปยอดขายเป็นไฟล์ภาพสำหรับส่งเข้าเครื่องพิมพ์ความร้อน
 def create_sales_report_ticket(report_data):
@@ -407,15 +440,21 @@ def create_sales_report_ticket(report_data):
             d.text((img_width - margin - (bbox[2] - bbox[0]), current_y), col3, fill='black', font=font)
             
         current_y += 26
-        
-    return img.crop((0, 0, img_width, current_y + 10))
+
+    cropped_img = img.crop((0, 0, img_width, current_y + 10))
+    img.close()    
+    return cropped_img
 
 
 # ฟังก์ชันคำสั่งยิงพิมพ์รายงานผ่านเข้าเครื่องพิมพ์ Worrex
 def print_sales_report_to_worrex(report_data):
+    printer = None
+    report_img = None
     try:
         printer = Network(PRINTER_IP, port=9100, timeout=15, profile="TUP500")
-        printer.image(create_sales_report_ticket(report_data))
+        report_img = create_sales_report_ticket(report_data)
+        printer.image(report_img)
+        report_img.close()
         printer.cut()
         printer.close()
         print(f"[+] พิมพ์รายงานสรุปยอดรอบ {report_data['start_date']} - {report_data['end_date']} ออกทางกระดาษสำเร็จ!")
@@ -423,7 +462,15 @@ def print_sales_report_to_worrex(report_data):
     except Exception as e:
         print(f"[Error] พิมพ์รายงานยอดขายขัดข้อง: {e}")
         return False
-
+    finally:
+        # ปิดทั้งรูปภาพและท่อเชื่อมต่อเครื่องพิมพ์เสมอ แม้เกิด Error
+        if report_img:
+            report_img.close()
+        if printer:
+            try:
+                printer.close()
+            except Exception:
+                pass
 
 def start_agent():
     print(f"[*] Local Printer Agent ทำงานแล้ว (พิมพ์แยกประเภทงาน) | IP: {PRINTER_IP}")
