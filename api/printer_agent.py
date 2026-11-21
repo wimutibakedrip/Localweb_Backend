@@ -462,7 +462,7 @@ def create_bill_report_ticket(report_data):
 
     bills = report_data.get("bills", [])
     for idx, bill in enumerate(bills, start=1):
-        order_code = bill.get("orderid") or f"{bill.get('id', '-')}#"
+        order_code = bill.get("orderid") or f"#{bill.get('id', '-')}"
         c_name = bill.get("customer_name") or "หน้าร้าน"
         # ตัดชื่อลูกค้าถ้ายาวเกินไปเพื่อไม่ให้ชนตัวเลขยอดเงินฝั่งขวา
         if len(c_name) > 16:
@@ -473,7 +473,7 @@ def create_bill_report_ticket(report_data):
         net_total = float(bill.get("grandtotal_price", 0.0))
 
         # บรรทัดที่ 1: ลำดับ (Item), OrderID, Customer Name และ Net Total
-        lines.append(("left_right", (f"#{idx} {order_code} ({c_name})", f"{net_total:,.2f}"), font_bold))
+        lines.append(("left_right", (f"{idx}# {order_code} ({c_name})", f"{net_total:,.2f}"), font_bold))
         # บรรทัดที่ 2: Date Time และ Payment Type
         lines.append(("left", f"   {dt_str} | ชำระ: {pay_method}", font_small))
 
