@@ -15,7 +15,7 @@ from pydantic import BaseModel
 
 from . import models
 from .database import engine, get_db, SessionLocal
-from .printer_agent import print_receipt_to_worrex, print_sales_report_to_worrex
+from .printer_agent import print_receipt_to_worrex, print_sales_report_to_worrex, print_bill_report_to_worrex
 
 models.Base.metadata.create_all(bind=engine)
 
@@ -139,6 +139,17 @@ async def optimized_printer_loop():
                 # ใช้ asyncio.to_thread เพื่อไม่ให้การพิมพ์รายงานไปบล็อกการทำงานของ API
                 if await asyncio.to_thread(print_sales_report_to_worrex, report_job_data):
                     sales_report_queue.pending_reports = [r for r in sales_report_queue.pending_reports if r["id"] != job_id]
+
+            #-------------------------------------------------------
+            if bill_report_queue.pending_reports:
+                current_bill_job = bill_report_queue.pending_reports[0]
+                b_job_id = current_bill_job["id"]
+                b_target_date = current_bill_job["selected_date"]
+
+                bill_job_data = build_bill_report_payload(db, b_job_id, b_target_date)
+                if await asyncio.to_thread(print_bill_report_to_worrex, bill_job_data):
+                    bill_report_queue.pending_reports = [r for r in bill_report_queue.pending_reports if r["id"] != b_job_id]
+
 
         except asyncio.CancelledError:
             print("[*] ฮาร์ดแวร์ Pi 4: ปิดระบบ Background Printer Task เรียบร้อย")
@@ -777,6 +788,88 @@ def get_pending_print_sales_reports(db: Session = Depends(get_db)):
 def clear_printed_sales_report(job_id: int):
     sales_report_queue.pending_reports = [r for r in sales_report_queue.pending_reports if r["id"] != job_id]
     return {"message": "เคลียร์คิวพิมพ์รายงานสำเร็จ"}
+
+
+# ==============================================================================
+# API คำขอพิมพ์รายงานสรุปยอดขายตามบิล (Bill-by-Bill Report)
+# ==============================================================================
+class BillReportPrintQueue:
+    pending_reports = []
+
+bill_report_queue = BillReportPrintQueue()
+
+def build_bill_report_payload(db: Session, job_id: int, target_date: str):
+    end_date = datetime.datetime.strptime(target_date, "%Y-%m-%d").date()
+    start_date = end_date - datetime.timedelta(days=6)
+    local_order_date = func.date(func.timezone('Asia/Bangkok', models.OrderModel.created_at))
+    date_filter = and_(local_order_date >= start_date, local_order_date <= end_date)
+
+    completed_orders = db.query(models.OrderModel)\
+        .filter(date_filter)\
+        .filter(models.OrderModel.status == models.OrderStatus.COMPLETED)\
+        .order_by(models.OrderModel.created_at.asc())\
+        .all()
+
+    total_revenue = 0.0
+    total_cash = 0.0
+    total_transfer = 0.0
+    bills_list = []
+
+    for o in completed_orders:
+        net = float(o.grandtotal_price or 0.0)
+        total_revenue += net
+
+        pay_val = o.payment_method.value if hasattr(o.payment_method, 'value') else str(o.payment_method or "-")
+        if pay_val == "เงินสด" or o.payment_method == models.OrderPayment.CASH:
+            total_cash += net
+        elif pay_val == "โอน" or o.payment_method == models.OrderPayment.TRANSFER:
+            total_transfer += net
+
+        dt_str = "-"
+        if o.created_at:
+            dt_str = o.created_at.astimezone(ZoneInfo("Asia/Bangkok")).strftime("%d/%m/%Y %H:%M")
+
+        bills_list.append({
+            "id": o.id,
+            "orderid": o.orderid or f"#{o.id}",
+            "customer_name": o.customer_name or "หน้าร้าน",
+            "created_at": dt_str,
+            "payment_method": pay_val,
+            "grandtotal_price": net
+        })
+
+    return {
+        "job_id": job_id,
+        "start_date": start_date.strftime("%d/%m/%Y"),
+        "end_date": end_date.strftime("%d/%m/%Y"),
+        "total_revenue": total_revenue,
+        "total_orders": len(bills_list),
+        "total_cash": total_cash,
+        "total_transfer": total_transfer,
+        "bills": bills_list
+    }
+
+@app.patch("/api/sales/request-print-bill-report")
+def request_print_bill_report(selected_date: str = Query(..., description="YYYY-MM-DD")):
+    report_request = {
+        "id": int(time.time()),
+        "selected_date": selected_date
+    }
+    bill_report_queue.pending_reports.append(report_request)
+    return {"message": "จัดคิวพิมพ์รายงานตามบิลสำเร็จ", "report_id": report_request["id"]}
+
+@app.get("/api/sales/pending-print-bill-report")
+def get_pending_print_bill_reports(db: Session = Depends(get_db)):
+    if not bill_report_queue.pending_reports:
+        return []
+    current_job = bill_report_queue.pending_reports[0]
+    payload = build_bill_report_payload(db, current_job["id"], current_job["selected_date"])
+    return [payload]
+
+@app.delete("/api/sales/clear-print-bill-report/{job_id}")
+def clear_printed_bill_report(job_id: int):
+    bill_report_queue.pending_reports = [r for r in bill_report_queue.pending_reports if r["id"] != job_id]
+    return {"message": "เคลียร์คิวพิมพ์รายงานตามบิลสำเร็จ"}
 
 #-------------------------------------------------------------------------------------------------------------------------------
 # เพิ่ม Dashboard

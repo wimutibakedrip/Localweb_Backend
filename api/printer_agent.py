@@ -445,6 +445,94 @@ def create_sales_report_ticket(report_data):
     img.close()    
     return cropped_img
 
+# ฟังก์ชันพิมพ์รายงานยอดตามบิล
+# เพิ่มฟังก์ชันสร้างภาพรายงานตามบิล (วางต่อจากฟังก์ชัน print_sales_report_to_worrex)
+def create_bill_report_ticket(report_data):
+    img_width = 576
+    margin = 20
+    lines = []
+
+    lines.append(("center", "\n", font_normal))
+    lines.append(("center", "Wimuti Bake & Drip", font_title))
+    lines.append(("center", "รายงานสรุปรายได้ตามบิล (รายออเดอร์)", font_bold))
+    lines.append(("center", f"รอบวันที่: {report_data['start_date']} ถึง {report_data['end_date']}", font_normal))
+    lines.append(("center", "-" * 66, font_normal))
+    lines.append(("left_right", ("ลำดับ / OrderID / ลูกค้า", "ยอดสุทธิ (฿)"), font_bold))
+    lines.append(("left", "   วัน-เวลาสั่งซื้อ | ช่องทางชำระเงิน", font_small))
+    lines.append(("center", "-" * 66, font_normal))
+
+    bills = report_data.get("bills", [])
+    for idx, bill in enumerate(bills, start=1):
+        order_code = bill.get("orderid") or f"#{bill.get('id', '-')}"
+        c_name = bill.get("customer_name") or "หน้าร้าน"
+        # ตัดชื่อลูกค้าถ้ายาวเกินไปเพื่อไม่ให้ชนตัวเลขยอดเงินฝั่งขวา
+        if len(c_name) > 16:
+            c_name = c_name[:15] + ".."
+
+        dt_str = bill.get("created_at", "-")
+        pay_method = bill.get("payment_method") or "-"
+        net_total = float(bill.get("grandtotal_price", 0.0))
+
+        # บรรทัดที่ 1: ลำดับ (Item), OrderID, Customer Name และ Net Total
+        lines.append(("left_right", (f"#{idx} {order_code} ({c_name})", f"{net_total:,.2f}"), font_bold))
+        # บรรทัดที่ 2: Date Time และ Payment Type
+        lines.append(("left", f"   {dt_str} | ชำระ: {pay_method}", font_small))
+
+    lines.append(("center", "-" * 66, font_normal))
+    lines.append(("left_right", ("จำนวนบิลสำเร็จทั้งหมด:", f"{report_data.get('total_orders', 0)} บิล"), font_normal))
+    lines.append(("left_right", ("  - ชำระด้วยเงินสด:", f"{report_data.get('total_cash', 0.0):,.2f} ฿"), font_normal))
+    lines.append(("left_right", ("  - ชำระด้วยยอดโอน:", f"{report_data.get('total_transfer', 0.0):,.2f} ฿"), font_normal))
+    lines.append(("center", "=" * 56, font_normal))
+    lines.append(("left_right", ("รายได้รวมสุทธิ:", f"{report_data.get('total_revenue', 0.0):,.2f} ฿"), font_bold))
+    lines.append(("center", "-" * 66, font_normal))
+    lines.append(("center", f"พิมพ์เมื่อ: {datetime.datetime.now().strftime('%d/%m/%Y %H:%M:%S')}", font_normal))
+    lines.append(("center", "\n\n\n", font_normal))
+
+    img = Image.new('RGB', (img_width, len(lines) * 26 + 60), color='white')
+    d = ImageDraw.Draw(img)
+    current_y = margin
+
+    for line_type, text_data, font in lines:
+        if line_type == "center":
+            bbox = d.textbbox((0, 0), text_data, font=font)
+            d.text(((img_width - (bbox[2] - bbox[0])) / 2, current_y), text_data, fill='black', font=font)
+        elif line_type == "left":
+            d.text((margin, current_y), text_data, fill='black', font=font)
+        elif line_type == "left_right":
+            left_text, right_text = text_data
+            d.text((margin, current_y), left_text, fill='black', font=font)
+            bbox = d.textbbox((0, 0), right_text, font=font)
+            d.text((img_width - margin - (bbox[2] - bbox[0]), current_y), right_text, fill='black', font=font)
+        current_y += 26
+
+    cropped_img = img.crop((0, 0, img_width, current_y + 10))
+    img.close()
+    return cropped_img
+
+
+def print_bill_report_to_worrex(report_data):
+    printer = None
+    report_img = None
+    try:
+        printer = Network(PRINTER_IP, port=9100, timeout=15, profile="TUP500")
+        report_img = create_bill_report_ticket(report_data)
+        printer.image(report_img)
+        report_img.close()
+        printer.cut()
+        printer.close()
+        print(f"[+] พิมพ์รายงานตามบิลรอบ {report_data['start_date']} - {report_data['end_date']} สำเร็จ!")
+        return True
+    except Exception as e:
+        print(f"[Error] พิมพ์รายงานตามบิลขัดข้อง: {e}")
+        return False
+    finally:
+        if report_img:
+            report_img.close()
+        if printer:
+            try:
+                printer.close()
+            except Exception:
+                pass
 
 # ฟังก์ชันคำสั่งยิงพิมพ์รายงานผ่านเข้าเครื่องพิมพ์ Worrex
 def print_sales_report_to_worrex(report_data):
@@ -543,6 +631,16 @@ def start_agent():
                         requests.delete(f"{VERCEL_API_URL}/sales/clear-print-report/{job_id}")
                         print(f"[+] ปิดคิวงานพิมพ์รายงานรหัส #{job_id} บนเซิร์ฟเวอร์เรียบร้อย")
 
+            # 3. ตรวจสอบคิวพิมพ์รายงานสรุปยอดขายตามบิล (Bill-by-Bill)
+            bill_report_res = requests.get(f"{VERCEL_API_URL}/sales/pending-print-bill-report")
+            if bill_report_res.status_code == 200:
+                bill_jobs = bill_report_res.json()
+                for job in bill_jobs:
+                    job_id = job.get("job_id")
+                    success = print_bill_report_to_worrex(job)
+                    if success:
+                        requests.delete(f"{VERCEL_API_URL}/sales/clear-print-bill-report/{job_id}")
+                        print(f"[+] ปิดคิวงานพิมพ์รายงานตามบิลรหัส #{job_id} เรียบร้อย")
 
         except Exception as e:
             printed_cache.clear()
