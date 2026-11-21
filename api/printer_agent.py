@@ -446,7 +446,6 @@ def create_sales_report_ticket(report_data):
     return cropped_img
 
 # ฟังก์ชันพิมพ์รายงานยอดตามบิล
-# เพิ่มฟังก์ชันสร้างภาพรายงานตามบิล (วางต่อจากฟังก์ชัน print_sales_report_to_worrex)
 def create_bill_report_ticket(report_data):
     img_width = 576
     margin = 20
@@ -463,7 +462,7 @@ def create_bill_report_ticket(report_data):
 
     bills = report_data.get("bills", [])
     for idx, bill in enumerate(bills, start=1):
-        order_code = bill.get("orderid") or f"#{bill.get('id', '-')}"
+        order_code = bill.get("orderid") or f"{bill.get('id', '-')}#"
         c_name = bill.get("customer_name") or "หน้าร้าน"
         # ตัดชื่อลูกค้าถ้ายาวเกินไปเพื่อไม่ให้ชนตัวเลขยอดเงินฝั่งขวา
         if len(c_name) > 16:
